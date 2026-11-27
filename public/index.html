@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Навигатор по регламентам</title><link rel="stylesheet" href="/app.css"></head>
+<body>
+<header><div class="brand">● <span>Навигатор</span></div><div class="badge">ДЕМО · ОБЕЗЛИЧЕННЫЕ МАТЕРИАЛЫ</div></header>
+<main>
+  <section class="intro"><p class="eyebrow">ПОИСК ПО КОРПОРАТИВНЫМ ПРАВИЛАМ</p><p class="lead">Спросите как коллегу. Помощник объяснит простыми словами и укажет документы, на которых основан ответ.</p></section>
+  <section class="ask card">
+    <label for="unit">Подразделение или центр компетенций <span>необязательно</span></label>
+    <select id="unit"><option value="">Не знаю / найти по всем</option></select>
+    <label for="question">Ваш вопрос</label>
+    <textarea id="question" rows="3" placeholder="Например: кто и за сколько дней должен подготовить расчёт проекта?"></textarea>
+    <div class="actions"><span class="hint">Ответ только по загруженным материалам. Не вводите личные данные.</span><button id="ask">Найти ответ <span>→</span></button></div>
+  </section>
+  <section id="result" class="result hidden"></section>
+  <footer>Демо-прототип. Не вводите ФИО, данные клиентов и текст реальных договоров.</footer>
+</main><script src="/app.js"></script></body></html>
+
