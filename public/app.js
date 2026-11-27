@@ -57,7 +57,7 @@ async function ask(question, unit='', compareAll=false, history=[]) {
     $('#continue-dialog')?.addEventListener('click',()=>{const text=$('#clarify-reply').value.trim();if(text)ask(question,unit,compareAll,[...history,text]);});
     $('#quality-request')?.addEventListener('click',()=>mountQualityForm(question,unit));
     $('#quality-cancel')?.addEventListener('click',()=>{$('#quality-cancel').textContent='Понятно';$('#quality-request').disabled=true;});
-    result.querySelectorAll('[data-rating]').forEach(button=>button.onclick=async()=>{const saved=await fetch('/api/feedback',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({rating:button.dataset.rating})}).then(r=>r.json());$('#feedback-msg').textContent=saved.message;if(button.dataset.rating!=='helpful')$('#feedback-msg').innerHTML+=` <button class="secondary" id="feedback-quality">Отправить вопрос в качество</button>`;$('#feedback-quality')?.addEventListener('click',()=>mountQualityForm(question,unit));});
+    result.querySelectorAll('[data-rating]').forEach(button=>button.onclick=async()=>{const saved=await fetch('/api/feedback',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({rating:button.dataset.rating})}).then(r=>r.json());$('#feedback-msg').textContent=saved.message;if(button.dataset.rating!=='helpful'&&!$('#quality-request'))$('#feedback-msg').innerHTML+=` <button class="secondary" id="feedback-quality">Отправить вопрос в качество</button>`;$('#feedback-quality')?.addEventListener('click',()=>mountQualityForm(question,unit));});
   } catch(error) { result.innerHTML=`<article class="card error">${esc(error.message)}</article>`; }
 }
 
