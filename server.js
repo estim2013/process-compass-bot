@@ -254,33 +254,43 @@ function mergeSources(...groups) {
   const first=units.map(unit=>all.filter(x=>x.unit===unit).sort((a,b)=>b.score-a.score)[0]);
   return [...first,...all.filter(x=>!first.includes(x)).sort((a,b)=>b.score-a.score)].slice(0,20);
 }
-async function rerankSources(question,candidates,requiredUnits=[]) {
-  if(candidates.length<=3)return candidates;
+async function classifySources(question,candidates) {
+  if(!candidates.length)return {direct:[]};
   const key=process.env.POLZA_RUNTIME_API_KEY;
-  if(!key)return candidates.slice(0,4);
+  if(!key)return null;
   try{
-    console.warn('Rerank candidates:',candidates.map(s=>`${s.id}:${s.section||'n/a'}`).join(','));
-    const response=await fetch(`${process.env.POLZA_BASE_URL||'https://polza.ai/api/v1'}/chat/completions`,{
-      method:'POST',headers:{authorization:`Bearer ${key}`,'content-type':'application/json'},signal:AbortSignal.timeout(45000),
-      body:JSON.stringify({model:process.env.RERANK_MODEL||process.env.POLZA_MODEL||'qwen/qwen3.8-flash',temperature:0,max_tokens:2000,enable_thinking:false,reasoning_effort:'none',response_format:{type:'json_object'},messages:[
-        {role:'system',content:'Ты ранжируешь фрагменты корпоративных регламентов для поиска. Сравнивай не общие совпадающие слова, а то, содержит ли фрагмент правило, которое прямо отвечает на вопрос, с учётом объекта, этапа, подразделения и условий. Ничего не отвечай и не выводи фактов. Верни только JSON вида {"ranked":[{"i":1,"score":10},...]}: индекс фрагмента и оценка от 0 до 10. Если фрагмент лишь похож по теме, но ответа не содержит, оцени низко.'},
-        {role:'user',content:`/no_think\nВопрос: ${question}\n\nКандидаты:\n${candidates.map((s,i)=>`[${i+1}] ${s.title}; подразделение: ${s.unit}; раздел ${s.section||'не указан'}\n${s.excerpt}`).join('\n\n')}`}
-      ]})
-    });
-    if(!response.ok)return candidates.slice(0,4);
-    const raw=(await response.json()).choices?.[0]?.message?.content||'';
-    const parsed=JSON.parse(raw);
-    if(!Array.isArray(parsed.ranked))return candidates.slice(0,4);
-    const ranked=parsed.ranked.filter(x=>Number.isInteger(x.i)&&x.i>=1&&x.i<=candidates.length&&Number.isFinite(Number(x.score))).sort((a,b)=>Number(b.score)-Number(a.score));
-    const order=ranked.filter(x=>Number(x.score)>=4).map(x=>candidates[x.i-1]);
-    console.warn('Rerank selected:',ranked.map(x=>`${candidates[x.i-1].id}:${candidates[x.i-1].section||'n/a'}=${Number(x.score)}`).join(','));
-    if(!order.length)return []; // A valid ranking with no qualifying chunks means there is no grounded context.
-    const selected=[];
-    for(const unit of requiredUnits){const match=order.find(x=>x.unit===unit);if(match&&!selected.includes(match))selected.push(match);}
-    const limit=Math.min(candidates.length,Math.max(4,requiredUnits.length*2));
-    for(const item of order)if(selected.length<limit&&!selected.includes(item))selected.push(item);
-    return selected;
-  }catch{return candidates.slice(0,4);}
+    const classifyAttempt=async (pool,maxTokens=700)=>{
+      const response=await fetch(`${process.env.POLZA_BASE_URL||'https://polza.ai/api/v1'}/chat/completions`,{
+        method:'POST',headers:{authorization:`Bearer ${key}`,'content-type':'application/json'},signal:AbortSignal.timeout(45000),
+        body:JSON.stringify({model:process.env.RERANK_MODEL||process.env.POLZA_MODEL||'qwen/qwen3.8-flash',temperature:0,max_tokens:maxTokens,enable_thinking:false,reasoning_effort:'none',reasoning:{effort:'none'},response_format:{type:'json_schema',json_schema:{name:'direct_evidence_indices',strict:true,schema:{type:'object',properties:{direct:{type:'array',items:{type:'integer'}}},required:['direct'],additionalProperties:false}}},messages:[
+          {role:'system',content:'Найди только фрагменты, которые содержат конкретное правило, роль, срок, условие или шаг, прямо применимый к вопросу. Это задача поиска доказательств, не ответ пользователю и не оценка уверенности. Не отмечай фоновые фрагменты, совпадение терминов или общую тему. Если применимого правила в наборе нет, верни пустой список. Если прямые правила есть в нескольких дирекциях, включи их все: приложение отдельно решит, нужно ли спросить дирекцию. Учитывай объект, этап и условия правила. Верни только объект с массивом direct, где значения — индексы фрагментов из входа, например {"direct":[1,3]}. Никаких других полей, текста и объяснений.'},
+          {role:'user',content:`/no_think\nВопрос: ${question}\nКандидаты:\n${pool.map((s,i)=>`[${i+1}] ${s.title}; дирекция: ${s.unit}; раздел ${s.section||'не указан'}\n${s.excerpt}`).join('\n\n')}`}
+        ]})
+      });
+      if(!response.ok)throw new Error(`classification API ${response.status}`);
+      const data=await response.json(),choice=data.choices?.[0],raw=choice?.message?.content||'';
+      if(choice?.finish_reason==='length')throw Object.assign(new Error(`classification output truncated (${raw.length} chars)`),{retryable:true});
+      let parsed;
+      try{parsed=JSON.parse(raw);}catch{throw Object.assign(new Error(`invalid structured evidence JSON (${raw.length} chars; finish=${choice?.finish_reason||'unknown'})`),{retryable:true});}
+      if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)||!Array.isArray(parsed.direct)||Object.keys(parsed).length!==1)throw Object.assign(new Error('invalid direct-index schema'),{retryable:true});
+      if(parsed.direct.some(i=>!Number.isInteger(i)||i<1||i>pool.length)||new Set(parsed.direct).size!==parsed.direct.length)throw Object.assign(new Error('invalid direct evidence indices'),{retryable:true});
+      const selected=new Set(parsed.direct);
+      return {direct:pool.filter((_,index)=>selected.has(index+1))};
+    };
+    try{
+      const result=await classifyAttempt(candidates);
+      console.warn('Direct evidence selection:',JSON.stringify({direct:result.direct.map(s=>`${s.id}:${s.section||'n/a'}`),candidateCount:candidates.length}));
+      if(!result.direct.length)console.warn('No direct evidence selected:',JSON.stringify({candidateCount:candidates.length,candidateUnitCount:new Set(candidates.map(s=>s.unit).filter(Boolean)).size}));
+      return result;
+    }catch(error){
+      if(!error.retryable)throw error;
+      console.warn(`Direct evidence retry on full evidence set: ${error.message}; candidates=${candidates.length}`);
+      const result=await classifyAttempt(candidates,1200);
+      console.warn('Direct evidence selection:',JSON.stringify({direct:result.direct.map(s=>`${s.id}:${s.section||'n/a'}`),candidateCount:candidates.length,retried:true}));
+      if(!result.direct.length)console.warn('No direct evidence selected after retry:',JSON.stringify({candidateCount:candidates.length,candidateUnitCount:new Set(candidates.map(s=>s.unit).filter(Boolean)).size}));
+      return result;
+    }
+  }catch(error){console.warn(`Direct evidence selection failed closed: ${error.message}`);return null;}
 }
 async function askModel(question, sources, history = [], attempt = 0, validationFeedback = '') {
   const key = process.env.POLZA_RUNTIME_API_KEY;
@@ -460,15 +470,36 @@ const server = http.createServer(async (req, res) => {
           if(!sources.length&&expansion?.clarification&&history.length<2&&searchUnits.length<=1)return send(res,200,{id,status:'clarify',answer:expansion.clarification});
         }catch{/* Keep the retrieval-only path available if query rewriting fails. */}
       }
-      if(sources.length>3)sources=await rerankSources(question,sources,searchUnits);
       const asksAcrossUnits=explicitUnits.length>1||compareAll;
-      if (!sources.length) {
-        await logEvent({ outcome: 'no_source', unit: unit || null });
+      let classification=await classifySources(question,sources);
+      if(classification&&classification.direct.length===0&&!retrievalExpanded){
+        try{
+          expansion=await expandSearch(question,history);retrievalExpanded=true;
+          if(expansion?.terms.length){
+            const expandedSources=await searchScope(expansion.terms.join(' '),searchUnits);
+            const merged=mergeSources(sources,expandedSources);
+            const candidateSetChanged=merged.length!==sources.length||merged.some((source,index)=>source!==sources[index]);
+            if(candidateSetChanged){sources=merged;classification=await classifySources(question,sources);}
+          }
+        }catch(error){console.warn(`Retrieval expansion failed: ${error.message}`);}
+      }
+      if(!classification){
+        await logEvent({outcome:'classifier_unavailable',unit:unit||null});
+        return send(res,200,{id,status:'escalation',answer:'Не удалось надёжно проверить найденные фрагменты. Не буду угадывать. Хотите отправить вопрос в службу качества?',citations:[],sources:[]});
+      }
+      if(classification.direct.length===0){
+        await logEvent({outcome:'no_source',unit:unit||null,sourceIds:sources.map(s=>s.id)});
         const requestedUnits=asksAcrossUnits?(searchUnits.length?searchUnits:[...new Set(docs.map(d=>d.unit))]):[];
         const scopeNote=requestedUnits.length?` по указанным подразделениям (${requestedUnits.join('; ')})`:'';
-        return send(res, 200, { id, answer: `В предоставленных материалах${scopeNote} не нашла подтверждённого ответа. Хотите отправить вопрос в службу качества?`, citations: [], sources: [], status: 'escalation' });
+        return send(res,200,{id,status:'escalation',answer:`В предоставленных материалах${scopeNote} не нашла подтверждённого ответа именно на этот вопрос. Хотите отправить обращение в службу качества?`,citations:[],sources:[]});
       }
+      // Context and unrelated fragments never reach answer generation or unit routing.
+      sources=classification.direct;
       const sourceUnits = [...new Set(sources.map(s=>s.unit))];
+      if(!sourceUnits.length||sourceUnits.some(x=>!x)){
+        await logEvent({outcome:'invalid_source_unit',unit:unit||null,sourceIds:sources.map(s=>s.id)});
+        return send(res,200,{id,status:'escalation',answer:'У найденного правила не указан центр компетенций или дирекция. Не буду переносить его на весь процесс. Хотите передать вопрос в службу качества?',citations:[],sources:[]});
+      }
       const unresolvedUnits=asksAcrossUnits?searchUnits.filter(named=>!sourceUnits.includes(named)):[];
       if(unresolvedUnits.length){
         await logEvent({outcome:'no_source',unit:null,sourceIds:sources.map(s=>s.id)});
@@ -488,16 +519,9 @@ const server = http.createServer(async (req, res) => {
       let generated, answer, status = 'answered', modelNotice = '';
       try {
         generated = await askModel(question, sources, history);
-        if(generated?.decision==='no_answer'&&!retrievalExpanded){
-          expansion=await expandSearch(question,history);retrievalExpanded=true;
-          if(expansion?.terms.length){
-            const expandedSources=await searchScope(expansion.terms.join(' '),searchUnits);
-            if(expandedSources.length){sources=await rerankSources(question,mergeSources(sources,expandedSources),searchUnits);generated=await askModel(question,sources,history);}
-          }
-        }
       }
-      catch(error) { console.warn(`Qwen answer rejected or unavailable: ${error.message}`); status = 'sources_only'; modelNotice = 'Модель вернула непроверяемый ответ или временно недоступна. Хотите передать вопрос в службу качества?'; }
-      if (!generated) { status = 'sources_only'; answer = 'Не могу сейчас сформулировать проверенный ответ. Хотите передать вопрос в службу качества?'; }
+      catch(error) { console.warn(`Qwen answer rejected or unavailable: ${error.message}`); status = 'escalation'; modelNotice = 'Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?'; }
+      if (!generated) { status = 'escalation'; answer = 'Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?'; }
       else if (generated.decision === 'clarify') {
         if (history.length >= 2) { status = 'escalation'; answer = 'После двух уточнений я всё ещё не могу выбрать однозначное правило. Хотите передать вопрос специалисту службы качества?'; }
         else { status = 'clarify'; answer = generated.clarifying_question; }
