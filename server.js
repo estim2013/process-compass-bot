@@ -6,7 +6,16 @@ import tls from 'node:tls';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normalizeComparable, validateClaim } from './lib/claim-validation.js';
+import { normalizeComparable } from './lib/claim-validation.js';
+import { pipelineFailure, safeFailureCode, classifyRetryOutcome, classifyTransportFailure } from './lib/pipeline-failure.js';
+import { validateModelAnswer } from './lib/model-answer-validator.js';
+import { selectAnswerContext } from './lib/answer-context.js';
+import { retryGuidance } from './lib/retry-guidance.js';
+import { evidenceClarification } from './lib/evidence-clarification.js';
+import { classifyScope, outOfScopeReply } from './lib/scope-filter.js';
+import { classifyRequestOutcome } from './lib/failure-class.js';
+import { missingAnswerFacets } from './lib/answer-completeness.js';
+import { expandProcessSearchQuery } from './lib/search-aliases.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const chunkerVersion = 'section-overlap-v2';
@@ -34,6 +43,32 @@ const port = Number(process.env.PORT || 3000);
 function send(res, status, body, type = 'application/json; charset=utf-8') {
   res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store' });
   res.end(type.startsWith('application/json') ? JSON.stringify(body) : body);
+}
+async function measureStage(trace, name, operation) {
+  const started = performance.now();
+  try { return await operation(); }
+  finally { trace.stages[name] = (trace.stages[name] || 0) + Math.round(performance.now() - started); }
+}
+function recordModelCall(trace, call) {
+  if (trace) trace.modelCalls.push({ purpose: call.purpose, attempt: call.attempt, retryReason: call.retryReason || null, durationMs: Math.round(call.durationMs), headerMs: call.headerMs == null ? null : Math.round(call.headerMs), bodyMs: call.bodyMs == null ? null : Math.round(call.bodyMs), inputChars: call.inputChars, outputChars: call.outputChars ?? null, reasoningChars: call.reasoningChars ?? null, status: call.status ?? null, finishReason: call.finishReason ?? null, inputTokens: call.inputTokens ?? null, outputTokens: call.outputTokens ?? null, error: call.error ?? null });
+}
+function recordPipelineFailure(trace, error, attempt) {
+  if (!trace) return;
+  const failure = safeFailureCode(error);
+  const candidates = trace.candidates || [];
+  const scores = candidates.map(candidate => candidate.score).filter(Number.isFinite);
+  trace.pipelineFailures ||= [];
+  trace.pipelineFailures.push({
+    ...failure,
+    attempt: attempt + 1,
+    candidateCount: candidates.length,
+    top1Score: scores[0] ?? null,
+    scoreGapTop1Top3: scores.length >= 3 ? scores[0] - scores[2] : null,
+    candidateChunkIds: candidates.slice(0, 20).map(candidate => candidate.chunkId)
+  });
+  if (attempt > 0) {
+    trace.retryOutcome = classifyRetryOutcome(trace.pipelineFailures,false);
+  }
 }
 function normalize(s) {
   let out = String(s || '').replace(/ё/gi, match => match === 'Ё' ? 'Е' : 'е');
@@ -189,12 +224,9 @@ function embeddingsReady(){
   return vectors>0&&vectors===db.prepare('SELECT COUNT(*) AS n FROM chunks').get().n;
 }
 
-async function search(q, unit = '') {
-  const terms = [...new Set(normalize(q).split(/\s+/).filter(t => t.length > 2 && !stopWords.has(t)))];
-  let queryVector=null;
-  const indexedVectors=embeddingSignature?db.prepare('SELECT COUNT(*) AS n FROM chunks WHERE embedding_json IS NOT NULL AND embedding_model=?').get(embeddingSignature).n:0;
-  const totalChunks=db.prepare('SELECT COUNT(*) AS n FROM chunks').get().n;
-  if(indexedVectors>0&&indexedVectors===totalChunks)try{const embedded=await getEmbeddings([q]);queryVector=embedded?.[0]||null;}catch{}
+async function search(q, unit = '', queryVector = null) {
+  const searchText=expandProcessSearchQuery(q);
+  const terms = [...new Set(normalize(searchText).split(/\s+/).filter(t => t.length > 2 && !stopWords.has(t)))];
   if (terms.length < 1 && !queryVector) return [];
   const matches = [];
   const chunks=db.prepare(`SELECT c.id,c.section,c.content,c.embedding_json,c.embedding_model,c.embedding_dim,d.id AS doc_id,d.title,d.unit,d.process,d.version,d.url,d.tags_json
@@ -247,12 +279,27 @@ async function search(q, unit = '') {
   if(picked.length<20)for(const m of relevant){if(!picked.includes(m))addMatch(m,false);if(picked.length>=20)break;}
   return picked;
 }
-async function searchScope(q, units = []) {
-  if(units.length<=1)return search(q,units[0]||'');
-  const results=await Promise.all(units.map(unit=>search(q,unit)));
-  const firstPerUnit=results.map(group=>group[0]).filter(Boolean);
-  const rest=results.flat().filter(source=>!firstPerUnit.includes(source)).sort((a,b)=>b.score-a.score);
-  return [...firstPerUnit,...rest].slice(0,20);
+async function queryEmbedding(q, trace = null) {
+  if (!embeddingsReady()) return null;
+  const started = performance.now();
+  try {
+    const embedded = await getEmbeddings([q]);
+    return embedded?.[0] || null;
+  } catch {
+    return null;
+  } finally {
+    if (trace) trace.stages.queryEmbeddingMs = (trace.stages.queryEmbeddingMs || 0) + Math.round(performance.now() - started);
+  }
+}
+async function searchScope(q, units = [], trace = null) {
+  const queryVector = await queryEmbedding(q, trace);
+  return measureStage(trace, 'localHybridSearchMs', async () => {
+    if(units.length<=1)return search(q,units[0]||'',queryVector);
+    const results=await Promise.all(units.map(unit=>search(q,unit,queryVector)));
+    const firstPerUnit=results.map(group=>group[0]).filter(Boolean);
+    const rest=results.flat().filter(source=>!firstPerUnit.includes(source)).sort((a,b)=>b.score-a.score);
+    return [...firstPerUnit,...rest].slice(0,20);
+  });
 }
 function mergeSources(...groups) {
   const unique=new Map();
@@ -268,92 +315,49 @@ function mergeSources(...groups) {
   const first=units.map(unit=>all.find(x=>x.unit===unit));
   return [...first,...all.filter(x=>!first.includes(x))].slice(0,20);
 }
-async function classifySources(question,candidates) {
-  if(!candidates.length)return {direct:[]};
-  const key=process.env.POLZA_RUNTIME_API_KEY;
-  if(!key)return null;
-  try{
-    const classifyAttempt=async (pool,maxTokens=700)=>{
-      let response;
-      try{response=await fetch(`${process.env.POLZA_BASE_URL||'https://polza.ai/api/v1'}/chat/completions`,{
-        method:'POST',headers:{authorization:`Bearer ${key}`,'content-type':'application/json'},signal:AbortSignal.timeout(45000),
-        body:JSON.stringify({model:process.env.RERANK_MODEL||process.env.POLZA_MODEL||'qwen/qwen3.8-flash',temperature:0,max_tokens:maxTokens,enable_thinking:false,reasoning_effort:'none',reasoning:{effort:'none'},response_format:{type:'json_schema',json_schema:{name:'direct_evidence_indices',strict:true,schema:{type:'object',properties:{direct:{type:'array',items:{type:'integer'}}},required:['direct'],additionalProperties:false}}},messages:[
-          {role:'system',content:'Найди только фрагменты, которые содержат конкретное правило, роль, срок, условие или шаг, прямо применимый к вопросу. Это задача поиска доказательств, не ответ пользователю и не оценка уверенности. Не отмечай фоновые фрагменты, совпадение терминов или общую тему. Если применимого правила в наборе нет, верни пустой список. Если прямые правила есть в нескольких дирекциях, включи их все: приложение отдельно решит, нужно ли спросить дирекцию. Учитывай объект, этап и условия правила. Верни только объект с массивом direct, где значения — индексы фрагментов из входа, например {"direct":[1,3]}. Никаких других полей, текста и объяснений.'},
-          {role:'user',content:`/no_think\nВопрос: ${question}\nКандидаты:\n${pool.map((s,i)=>`[${i+1}] ${s.title}; дирекция: ${s.unit}; раздел ${s.section||'не указан'}\n${s.excerpt}`).join('\n\n')}`}
-        ]})
-      });}catch(error){throw Object.assign(error,{retryable:true});}
-      if(!response.ok)throw Object.assign(new Error(`classification API ${response.status}`),{retryable:retryableApiStatuses.has(response.status)});
-      const data=await response.json(),choice=data.choices?.[0],raw=choice?.message?.content||'';
-      if(choice?.finish_reason==='length')throw Object.assign(new Error(`classification output truncated (${raw.length} chars)`),{retryable:true});
-      let parsed;
-      try{parsed=JSON.parse(raw);}catch{throw Object.assign(new Error(`invalid structured evidence JSON (${raw.length} chars; finish=${choice?.finish_reason||'unknown'})`),{retryable:true});}
-      if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)||!Array.isArray(parsed.direct)||Object.keys(parsed).length!==1)throw Object.assign(new Error('invalid direct-index schema'),{retryable:true});
-      if(parsed.direct.some(i=>!Number.isInteger(i)||i<1||i>pool.length)||new Set(parsed.direct).size!==parsed.direct.length)throw Object.assign(new Error('invalid direct evidence indices'),{retryable:true});
-      const selected=new Set(parsed.direct);
-      return {direct:pool.filter((_,index)=>selected.has(index+1))};
-    };
-    try{
-      const result=await classifyAttempt(candidates);
-      console.warn('Direct evidence selection:',JSON.stringify({direct:result.direct.map(s=>`${s.id}:${s.section||'n/a'}`),candidateCount:candidates.length}));
-      if(!result.direct.length)console.warn('No direct evidence selected:',JSON.stringify({candidateCount:candidates.length,candidateUnitCount:new Set(candidates.map(s=>s.unit).filter(Boolean)).size}));
-      return result;
-    }catch(error){
-      if(!error.retryable)throw error;
-      console.warn(`Direct evidence retry on full evidence set: ${error.message}; candidates=${candidates.length}`);
-      await retryDelay(500);
-      const result=await classifyAttempt(candidates,1200);
-      console.warn('Direct evidence selection:',JSON.stringify({direct:result.direct.map(s=>`${s.id}:${s.section||'n/a'}`),candidateCount:candidates.length,retried:true}));
-      if(!result.direct.length)console.warn('No direct evidence selected after retry:',JSON.stringify({candidateCount:candidates.length,candidateUnitCount:new Set(candidates.map(s=>s.unit).filter(Boolean)).size}));
-      return result;
-    }
-  }catch(error){console.warn(`Direct evidence selection failed closed: ${error.message}`);return null;}
-}
-async function askModel(question, sources, history = [], attempt = 0, validationFeedback = '') {
+async function askModel(question, sources, history = [], attempt = 0, validationFeedback = '', trace = null) {
   const key = process.env.POLZA_RUNTIME_API_KEY;
   if (!key) return null;
-  let response;
+  const callStarted = performance.now();
+  let response, headersAt = null;
   try{response = await fetch(`${process.env.POLZA_BASE_URL || 'https://polza.ai/api/v1'}/chat/completions`, {
     method: 'POST', headers: { 'authorization': `Bearer ${key}`, 'content-type': 'application/json' },
     signal: AbortSignal.timeout(attempt?90000:60000),
-    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: attempt?0:0.1, max_tokens: attempt?8000:4000, enable_thinking: false, reasoning_effort: 'none', response_format: { type: 'json_schema', json_schema: { name: 'grounded_process_answer', strict: true, schema: { type: 'object', properties: { decision: { type: 'string', enum: ['answer','clarify','no_answer'] }, intent_clear: { type: 'boolean' }, intent_summary: { type: 'string' }, claims: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, source_ref: { type: 'integer' }, evidence: { type: 'string' } }, required: ['text','source_ref','evidence'], additionalProperties: false } }, clarifying_question: { type: 'string' } }, required: ['decision','intent_clear','intent_summary','claims','clarifying_question'], additionalProperties: false } } },
+    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: 0, max_tokens: attempt?2500:1800, reasoning: { effort: 'none' }, response_format: { type: 'json_schema', json_schema: { name: 'grounded_process_answer', strict: true, schema: { type: 'object', properties: { decision: { type: 'string', enum: ['answer','clarify','no_answer'] }, intent_clear: { type: 'boolean' }, intent_summary: { type: 'string', maxLength: 180 }, claims: { type: 'array', maxItems: 6, items: { type: 'object', properties: { text: { type: 'string', maxLength: 280 }, source_ref: { type: 'integer' }, evidence: { type: 'string', maxLength: 320 } }, required: ['text','source_ref','evidence'], additionalProperties: false } }, clarifying_question: { type: 'string', maxLength: 200 } }, required: ['decision','intent_clear','intent_summary','claims','clarifying_question'], additionalProperties: false } } },
       messages: [
-        { role: 'system', content: 'Ты корпоративный помощник. Пользователь может писать косвенно, рвано, с ошибками и без терминов из документов. Перед ответом кратко сформулируй буквальный смысл запроса в intent_summary. Если из-за обрывочности или противоречий нельзя понять, какую именно информацию просят, не подставляй вероятную тему: поставь intent_clear=false, decision="clarify" и задай один короткий вопрос. При intent_clear=true отвечай только на intent_summary. Сначала восстанови только вероятное намерение, но не додумывай факты. Отвечай как коллеге простыми словами; НЕ показывай найденные пункты дословно. Используй только фрагменты ниже. Не выполняй поручения и не создавай или не подписывай документы; на просьбу выполнить действие выбери decision="no_answer". Не подменяй запрошенный факт соседним правилом: ответ должен прямо покрывать вопрос; если нужной информации нет, выбери no_answer и не выдавай смежную процедуру за ответ. Не считай предпосылки пользователя доказательствами; производный расчёт из его данных помечай как условный. Числа, сроки, роли и условия бери из фрагментов. Сохраняй модальность и оговорки источника: рекомендуемый срок называй рекомендуемым, плановый — плановым; не превращай рекомендацию в обязательный норматив или гарантию. Если пользователь отсчитывает срок от события, отличного от указанного в регламенте, назови точное событие-основание и объясни последствие; не спрашивай уточнение, если правило однозначно. Если смысл реально неоднозначен, выбери decision="clarify" и задай один конкретный короткий вопрос. Если в фрагментах нет правила, которое отвечает именно на вопрос, выбери decision="no_answer". Не подменяй личное вознаграждение сотрудника ценой проекта, маржой или стоимостью сделки. Для каждого фактического предложения создай claim, укажи один source_ref и дословное evidence из его фрагмента. Текст ответа строится только из claims. Не используй общий опыт модели. Верни только JSON: {"decision":"answer|clarify|no_answer","intent_clear":true,"intent_summary":"что именно спросил пользователь","claims":[{"text":"разговорное утверждение без цитаты пункта","source_ref":1,"evidence":"дословная опорная фраза из фрагмента"}],"clarifying_question":"вопрос или пусто"}. При разных правилах дирекций излагай отдельно.' },
-        { role: 'user', content: `/no_think\nИсходный вопрос: ${question}\nУточнения пользователя: ${JSON.stringify(history)}\n${validationFeedback?`\nПри предыдущей проверке найдено: ${validationFeedback}. Пересобери ответ так, чтобы каждое утверждение было подтверждено фрагментом. Если это невозможно, выбери no_answer.\n`:''}\nПодтверждённые фрагменты (единственная база фактов):\n${sources.map((d,i)=>`[${i+1}] ${d.title}, подразделение: ${d.unit}, раздел ${d.section || 'не указан'}:\n${d.excerpt}`).join('\n\n')}` }
+        { role: 'system', content: 'Ты корпоративный помощник. Пользователь может писать косвенно, рвано, с ошибками и без терминов из документов. Перед ответом кратко сформулируй буквальный смысл запроса в intent_summary. Если из-за обрывочности или противоречий нельзя понять, какую именно информацию просят, не подставляй вероятную тему: поставь intent_clear=false, decision="clarify" и задай один короткий вопрос. При intent_clear=true отвечай только на intent_summary. Не уточняй у пользователя, «тот ли это раздел», когда найденный фрагмент прямо отвечает на вопрос. Не считай различие бытового и регламентного глагола (например, «выбрать» и «назначить») самостоятельной неоднозначностью: сначала сопоставь роли, действие и объект в найденном правиле. Уточняй только если после этого остаются как минимум два разных применимых варианта. Сначала восстанови только вероятное намерение, но не додумывай факты. Отвечай как коллеге простыми словами; НЕ показывай найденные пункты дословно. Используй только фрагменты ниже. Не выполняй поручения и не создавай или не подписывай документы; на просьбу выполнить действие выбери decision="no_answer". Не подменяй запрошенный факт соседним правилом: ответ должен прямо покрывать вопрос; если нужной информации нет, выбери no_answer и не выдавай смежную процедуру за ответ. Не считай предпосылки пользователя доказательствами; производный расчёт из его данных помечай как условный. Числа, сроки, роли и условия бери из фрагментов. При границах диапазонов сохраняй направление и включительность исходного условия: «не более N» включает N, «более N» не включает N; не выбирай соседнюю ветку. Сохраняй модальность и оговорки источника: рекомендуемый срок называй рекомендуемым, плановый — плановым; не превращай рекомендацию в обязательный норматив или гарантию. Переноси ограничение области действия правила: если пункт начинается с условия или описывает особый случай, не распространяй следующие шаги на все заявки/проекты; явно называй это условие. Перед ответом разложи вопрос на все запрошенные части, особенно сочетания «кто и что», «кто и при каких условиях», «что и в какой срок». На каждую часть дай отдельное подтвержденное утверждение; если источник подтверждает только часть, скажи, что именно осталось не подтверждено, и не создавай впечатление полного ответа. Для вопросов «кто/кого/кому» назови конкретную должность или роль, а не только цель действия. Для перечней условий и материалов проверь каждый перечисленный в источнике пункт и не заменяй список одним примером. Если правило в одном пункте применимо только при условии, повтори это условие в ответе, даже если вопрос его не назвал. Если пользователь отсчитывает срок от события, отличного от указанного в регламенте, назови точное событие-основание и объясни последствие; не спрашивай уточнение, если правило однозначно. Если смысл реально неоднозначен, выбери decision="clarify" и задай один конкретный короткий вопрос. Если в фрагментах нет правила, которое отвечает именно на вопрос, выбери decision="no_answer". Не подменяй личное вознаграждение сотрудника ценой проекта, маржой или стоимостью сделки. Для каждого фактического утверждения создай claim с одним source_ref. В evidence скопируй дословно короткий непрерывный фрагмент до 320 символов; не копируй целый раздел. Пиши только необходимые для ответа утверждения и условия; одно claim может кратко объединить соседние действия из одного пункта. Текст ответа строится только из claims. Не используй общий опыт модели. Верни только JSON: {"decision":"answer|clarify|no_answer","intent_clear":true,"intent_summary":"краткий смысл вопроса","claims":[{"text":"короткое утверждение","source_ref":1,"evidence":"краткий дословный фрагмент источника"}],"clarifying_question":"вопрос или пусто"}. При разных правилах дирекций излагай отдельно.' },
+        { role: 'user', content: `/no_think\nИсходный вопрос: ${question}\nУточнения пользователя: ${JSON.stringify(history)}\n${validationFeedback?`\nПрошлая попытка не прошла проверку: ${validationFeedback}. Исправь только неподтверждённое утверждение, сократи формулировки и evidence до самой короткой точной опоры. Если после проверки источников ответ действительно отсутствует, выбери no_answer.\n`:''}\nПодтверждённые фрагменты (единственная база фактов):\n${sources.map((d,i)=>`[${i+1}] ${d.title}, подразделение: ${d.unit}, раздел ${d.section || 'не указан'}:\n${d.excerpt}`).join('\n\n')}` }
       ]
     })
-  });}catch(error){if(attempt===0){await retryDelay(500);return askModel(question,sources,history,1,validationFeedback||'временная ошибка соединения с моделью');}throw error;}
-  if (!response.ok) { if(attempt===0&&retryableApiStatuses.has(response.status)){await retryDelay(500);return askModel(question,sources,history,1,validationFeedback||`временный ответ API ${response.status}`);} throw new Error(`Polza API вернул ${response.status}`); }
-  const data = await response.json();
+  }); headersAt=performance.now();}catch(error){const failure=pipelineFailure('model_transport',classifyTransportFailure({errorName:error.name}),'Model request failed',{cause:error});recordPipelineFailure(trace,failure,attempt);recordModelCall(trace,{purpose:'answer',attempt,retryReason:validationFeedback,durationMs:performance.now()-callStarted,error:error.name||'request_error'});if(attempt===0){await retryDelay(500);return askModel(question,sources,history,1,validationFeedback||'временная ошибка соединения с моделью',trace);}throw failure;}
+  if (!response.ok) {const code=classifyTransportFailure({status:response.status});const failure=pipelineFailure('model_transport',code,`Polza API returned ${response.status}`);recordPipelineFailure(trace,failure,attempt);recordModelCall(trace,{purpose:'answer',attempt,retryReason:validationFeedback,durationMs:performance.now()-callStarted,headerMs:headersAt-callStarted,status:response.status});if(attempt===0&&retryableApiStatuses.has(response.status)){await retryDelay(500);return askModel(question,sources,history,1,validationFeedback||`временный ответ API ${response.status}`,trace);} throw failure; }
+  let data;
+  try { data = await response.json(); } catch (error) { const failure=pipelineFailure('model_output', 'invalid_json', 'Model returned invalid JSON', { cause: error });recordModelCall(trace,{purpose:'answer',attempt,retryReason:validationFeedback,durationMs:performance.now()-callStarted,headerMs:headersAt-callStarted,bodyMs:performance.now()-headersAt,status:response.status});recordPipelineFailure(trace,failure,attempt);throw failure; }
+  const finishReason=data.choices?.[0]?.finish_reason;
   const raw = data.choices?.[0]?.message?.content;
-  if (!raw && attempt===0) return askModel(question,sources,history,1);
-  if (!raw) throw new Error(`Qwen returned empty content (finish_reason=${data.choices?.[0]?.finish_reason||'unknown'}; message_fields=${Object.keys(data.choices?.[0]?.message||{}).join(',')})`);
-  let result;
+  const parsedAt=performance.now();
+  const modelMessage=data.choices?.[0]?.message||{};
+  const reasoningValue=modelMessage.reasoning_content??modelMessage.reasoning??modelMessage.reasoning_details??null;
+  const reasoningChars=typeof reasoningValue==='string'?reasoningValue.length:reasoningValue==null?0:JSON.stringify(reasoningValue).length;
+  recordModelCall(trace,{purpose:'answer',attempt,retryReason:validationFeedback,durationMs:parsedAt-callStarted,headerMs:headersAt-callStarted,bodyMs:parsedAt-headersAt,status:response.status,finishReason:data.choices?.[0]?.finish_reason,inputTokens:data.usage?.prompt_tokens,outputTokens:data.usage?.completion_tokens,outputChars:typeof raw==='string'?raw.length:0,reasoningChars});
+  if (!raw) { const code=finishReason==='length'?'output_truncated':'empty_response';const failure=pipelineFailure('model_output', code, code==='output_truncated'?'Model output reached its token limit':'Model returned empty content');recordPipelineFailure(trace,failure,attempt);if(attempt===0)return askModel(question,sources,history,1,code==='output_truncated'?'ответ оборвался на лимите длины':'пустой ответ модели',trace);throw failure; }
+  const validationStarted=performance.now();
   try {
-    result = JSON.parse(raw);
-    if (!['answer','clarify','no_answer'].includes(result.decision)) throw new Error('Некорректный тип ответа модели');
-    if(typeof result.intent_clear!=='boolean'||!result.intent_summary?.trim())throw new Error('Нет подтверждённой формулировки намерения');
-    if(!result.intent_clear&&result.decision!=='clarify')throw new Error('Ответ сформирован при неясном намерении');
-    if (result.decision === 'answer') {
-      const claims = Array.isArray(result.claims) ? result.claims : [];
-      if(claims.length>6)throw new Error('Ответ содержит слишком много утверждений для проверки');
-      if (!claims.length) throw new Error('Ответ модели не содержит проверяемых утверждений');
-      for (const claim of claims) {
-        const ref=claim.source_ref, evidence=String(claim.evidence||'').trim();
-        const evidenceWords=normalize(evidence).split(/\s+/).filter(word=>word.length>=3);
-        if (!claim.text?.trim() || !Number.isInteger(ref) || ref<1 || ref>sources.length || evidenceWords.length<3) throw new Error('Не хватает подтверждения для ответа');
-        const normalizedEvidence=normalizeComparable(evidence);
-        const normalizedSource=normalizeComparable(sources[ref-1].excerpt);
-        if (!normalizedSource.includes(normalizedEvidence)) throw new Error('Опора ответа не найдена в документе');
-        validateClaim(claim.text,evidence);
-      }
-      const refs=[...new Set(claims.map(c=>c.source_ref))];
-      return { ...result, claims, citation_refs: refs, answer: claims.map(c=>`${c.text.trim()} [${c.source_ref}]`).join(' ') };
-    }
-    if (result.decision === 'clarify' && !result.clarifying_question?.trim()) throw new Error('Нет текста уточнения');
+    const result = validateModelAnswer(raw,sources,normalize);
+    if (attempt > 0 && trace) trace.retryOutcome = 'recovered';
     return result;
   } catch(error) {
-    if(attempt===0)return askModel(question,sources,history,1,error.message);
+    recordPipelineFailure(trace,error,attempt);
+    if(attempt===0){
+      const retrySources=error?.stage==='evidence_binding'&&error?.code==='span_not_found'?sources.slice(0,1):sources;
+      return askModel(question,retrySources,history,1,retryGuidance(error),trace);
+    }
+    if (trace) {
+      trace.retryOutcome=classifyRetryOutcome(trace.pipelineFailures,false);
+    }
     throw error;
+  } finally {
+    if(trace)trace.stages.localValidationMs=(trace.stages.localValidationMs||0)+Math.round(performance.now()-validationStarted);
   }
 }
 async function expandSearch(question, history = []) {
@@ -361,7 +365,7 @@ async function expandSearch(question, history = []) {
   if (!key) return null;
   const response = await fetch(`${process.env.POLZA_BASE_URL || 'https://polza.ai/api/v1'}/chat/completions`, {
     method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, signal: AbortSignal.timeout(15000),
-    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: 0, max_tokens: 500, enable_thinking: false, reasoning_effort: 'none', response_format: { type: 'json_object' },
+    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: 0, max_tokens: 500, reasoning: { effort: 'none' }, response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: 'Преобразуй неформальный или рваный вопрос в поисковые слова для корпоративных регламентов: сохрани ключевые слова пользователя и добавь их нейтральные корпоративные эквиваленты, когда регламент может называть тот же смысл иначе. Это только запрос для поиска, не ответ. Не добавляй цифры, сроки, роли, решения или новые обстоятельства. Если можно понять два разных намерения, задай один короткий вопрос и верни пустые search_terms. Верни только JSON: {"search_terms":["..."],"clarifying_question":"..."}. До 8 терминов.' },
         { role: 'user', content: `/no_think\nВопрос: ${question}\nУточнения: ${JSON.stringify(history)}` }
@@ -467,7 +471,7 @@ const server = http.createServer(async (req, res) => {
       const activeEmbeddingModel=process.env.EMBEDDINGS_MODEL || null;
       const vectorCount=embeddingSignature?db.prepare('SELECT COUNT(*) AS n FROM chunks WHERE embedding_json IS NOT NULL AND embedding_model=?').get(embeddingSignature).n:0;
       const chunkCount=db.prepare('SELECT COUNT(*) AS n FROM chunks').get().n;
-      return send(res, 200, { ok: true, model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', keyConfigured: Boolean(process.env.POLZA_RUNTIME_API_KEY), indexedDocuments: docs.filter(d=>d.text).length, registryDocuments: docs.length, chunkCount, embeddingModel: activeEmbeddingModel, embeddedChunks: vectorCount, retrieval: vectorCount===chunkCount&&chunkCount>0 ? 'hybrid' : 'lexical' });
+      return send(res, 200, { ok: true, model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', indexVersion: chunkerVersion, keyConfigured: Boolean(process.env.POLZA_RUNTIME_API_KEY), indexedDocuments: docs.filter(d=>d.text).length, registryDocuments: docs.length, chunkCount, embeddingModel: activeEmbeddingModel, embeddedChunks: vectorCount, retrieval: vectorCount===chunkCount&&chunkCount>0 ? 'hybrid' : 'lexical' });
     }
     if (req.method === 'GET' && url.pathname === '/api/units') return send(res, 200, [...new Set(docs.map(d => d.unit))]);
     if (req.method === 'GET' && url.pathname === '/api/registry') return send(res, 200, docs.map(({id,title,unit,process,version,status,source,tags,url})=>({id,title,unit,process,version,status,source,tags,url,indexed:Boolean(docs.find(x=>x.id===id)?.text)})));
@@ -479,87 +483,126 @@ const server = http.createServer(async (req, res) => {
       if (unit && !docs.some(d => d.unit === unit)) return send(res, 400, { error: 'Неизвестное подразделение' });
       const explicitUnits=unitsMentioned([question,...history].join(' '));
       const searchUnits=explicitUnits.length>1?explicitUnits:(unit?[unit]:explicitUnits);
-      let searchQuestion = [question, ...history].filter(Boolean).join(' ');
-      const id = randomUUID();
-      let sources=await searchScope(searchQuestion,searchUnits);
-      let retrievalExpanded=false,expansion=null;
-      if(!sources.length||(!embeddingsReady()&&(sources[0]?.coverage||0)<0.45)||searchUnits.length>1){
-        try{
-          expansion=await expandSearch(question,history);retrievalExpanded=true;
-          if(expansion?.terms.length)sources=mergeSources(sources,await searchScope(expansion.terms.join(' '),searchUnits));
-          if(!sources.length&&expansion?.clarification&&history.length<2&&searchUnits.length<=1)return send(res,200,{id,status:'clarify',answer:expansion.clarification});
-        }catch{/* Keep the retrieval-only path available if query rewriting fails. */}
-      }
       const asksAcrossUnits=explicitUnits.length>1||compareAll;
-      let classification=await classifySources(question,sources);
-      if(classification&&classification.direct.length===0&&!retrievalExpanded){
+      const searchQuestion = [question,...history].filter(Boolean).join(' ');
+      const id = randomUUID();
+      const trace={id,started:performance.now(),stages:{},modelCalls:[],candidates:[],refusalReason:null,queryExpansionCalled:false};
+      const finish=async(status,body,httpStatus=200)=>{
+        const totalMs=Math.round(performance.now()-trace.started);
+        const safeModelCalls=trace.modelCalls.map(({purpose,attempt,durationMs,headerMs,bodyMs,status,finishReason,inputTokens,outputTokens,outputChars,reasoningChars})=>({purpose,attempt,durationMs,headerMs,bodyMs,status,finishReason,inputTokens,outputTokens,outputChars,reasoningChars}));
+        const latency={totalMs,stages:trace.stages,modelCallCount:safeModelCalls.length,modelTimeMs:safeModelCalls.reduce((n,x)=>n+(x.durationMs||0),0),retryCount:safeModelCalls.filter(x=>x.attempt>0).length,sourceCount:trace.sourceCount||0,contextSourceCount:trace.contextSourceCount||0,unitCount:trace.unitCount||0,modelCalls:safeModelCalls};
+        const outcome=body.status||status;
+        const pipelineFailures=(trace.pipelineFailures||[]).map(({stage,code,attempt})=>({stage,code,attempt}));
+        const failureClass=classifyRequestOutcome(outcome,trace.refusalReason,pipelineFailures);
+        void logEvent({outcome, failureClass, unit:body.unit||unit||null,requestId:id,sourceIds:trace.sourceIds||[],refusalReason:trace.refusalReason||null,pipelineFailures,rejectedClaimCodes:trace.rejectedClaimCodes||[],retryOutcome:trace.retryOutcome||null,latency}).catch(error=>console.warn('Latency log write failed: '+error.message));
+        if(input.debug===true&&isQualityAdmin(req))body.diagnostics={requestId:id,latency,failureClass,refusalReason:trace.refusalReason||null,pipelineFailures,retryOutcome:trace.retryOutcome||null,queryExpansionCalled:trace.queryExpansionCalled,candidates:trace.candidates};
+        return send(res,httpStatus,body);
+      };
+      const offTopic=classifyScope(question,history);
+      if(offTopic){trace.refusalReason='OUT_OF_SCOPE';return finish(200,{id,status:'out_of_scope',answer:outOfScopeReply(offTopic)});}
+      let sources=await measureStage(trace,'retrievalMs',()=>searchScope(searchQuestion,searchUnits,trace));
+      trace.sourceCount=sources.length;trace.unitCount=new Set(sources.map(s=>s.unit).filter(Boolean)).size;trace.sourceIds=[...new Set(sources.map(s=>s.id))];
+      const captureCandidates=items=>items.map((s,index)=>({rank:index+1,chunkId:s.chunkId,documentId:s.id,section:s.section||null,score:Number.isFinite(s.score)?s.score:null,similarity:Number.isFinite(s.similarity)?s.similarity:null,lexicalScore:Number.isFinite(s.lexicalScore)?s.lexicalScore:null,coverage:Number.isFinite(s.coverage)?s.coverage:null}));
+      trace.candidates=captureCandidates(sources);
+      let expansion=null;
+      // Query rewriting is a slow fallback. Keep it off the ordinary path and avoid it just because several units were named.
+      if(!sources.length||(!embeddingsReady()&&(sources[0]?.coverage||0)<0.45)){
         try{
-          expansion=await expandSearch(question,history);retrievalExpanded=true;
-          if(expansion?.terms.length){
-            const expandedSources=await searchScope(expansion.terms.join(' '),searchUnits);
-            const merged=mergeSources(sources,expandedSources);
-            const candidateSetChanged=merged.length!==sources.length||merged.some((source,index)=>source!==sources[index]);
-            if(candidateSetChanged){sources=merged;classification=await classifySources(question,sources);}
+          try{
+            trace.queryExpansionCalled=true;
+            expansion=await measureStage(trace,'queryExpansionMs',()=>expandSearch(question,history));
+            trace.modelCalls.push({purpose:'query_expansion',attempt:0,durationMs:trace.stages.queryExpansionMs,status:'completed'});
+          }catch(error){
+            trace.modelCalls.push({purpose:'query_expansion',attempt:0,durationMs:trace.stages.queryExpansionMs||0,status:'error',error:error.name||'request_error'});
+            throw error;
           }
-        }catch(error){console.warn(`Retrieval expansion failed: ${error.message}`);}
+          if(expansion?.terms.length)sources=mergeSources(sources,await measureStage(trace,'expandedRetrievalMs',()=>searchScope(expansion.terms.join(' '),searchUnits,trace)));
+          trace.sourceCount=sources.length;trace.unitCount=new Set(sources.map(s=>s.unit).filter(Boolean)).size;trace.sourceIds=[...new Set(sources.map(s=>s.id))];
+          trace.candidates=captureCandidates(sources);
+          if(!sources.length&&expansion?.clarification&&history.length<2&&searchUnits.length<=1)return finish(200,{id,status:'clarify',answer:expansion.clarification});
+        }catch(error){console.warn('Retrieval expansion failed: '+error.message);}
       }
-      if(!classification){
-        await logEvent({outcome:'classifier_unavailable',unit:unit||null});
-        return send(res,200,{id,status:'escalation',answer:'Не удалось надёжно проверить найденные фрагменты. Не буду угадывать. Хотите отправить вопрос в службу качества?',citations:[],sources:[]});
+      if(!sources.length){
+        trace.refusalReason='NO_CANDIDATES';
+        return finish(200,{id,status:'escalation',answer:'В предоставленных материалах не нашла подтверждённого ответа именно на этот вопрос. Хотите отправить обращение в службу качества?',citations:[],sources:[]});
       }
-      if(classification.direct.length===0){
-        await logEvent({outcome:'no_source',unit:unit||null,sourceIds:sources.map(s=>s.id)});
-        const requestedUnits=asksAcrossUnits?(searchUnits.length?searchUnits:[...new Set(docs.map(d=>d.unit))]):[];
-        const scopeNote=requestedUnits.length?` по указанным подразделениям (${requestedUnits.join('; ')})`:'';
-        return send(res,200,{id,status:'escalation',answer:`В предоставленных материалах${scopeNote} не нашла подтверждённого ответа именно на этот вопрос. Хотите отправить обращение в службу качества?`,citations:[],sources:[]});
+      // One structured model call now selects evidence and drafts claims together; citation validation remains deterministic in askModel.
+      const answerSources=selectAnswerContext(sources);
+      trace.contextSourceCount=answerSources.length;
+      let generated,answer,status='answered',modelNotice='';
+      try{generated=await measureStage(trace,'evidenceAndAnswerMs',()=>askModel(question,answerSources,history,0,'',trace));}
+      catch(error){const failure=safeFailureCode(error);console.warn(`Answer pipeline failed at ${failure.stage}/${failure.code}`);
+        const candidate=answerSources[0];
+        const clarification=failure.stage==='evidence_binding'&&failure.code==='span_not_found'&&candidate?.coverage>=0.2?evidenceClarification(candidate):null;
+        if(clarification){trace.refusalReason='EVIDENCE_LINK_AMBIGUOUS';return finish(200,{id,status:'clarify',answer:clarification,citations:[{ref:1,title:candidate.title,unit:candidate.unit,section:candidate.section,url:candidate.url}]});}
+        status='escalation';trace.refusalReason='MODEL_CALL_OR_VALIDATION_ERROR';modelNotice='Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?';}
+      if(generated?.decision==='answer'){
+        let missingFacets=missingAnswerFacets(question,generated.claims);
+        if(missingFacets.length){
+          trace.completenessRetry=true;
+          const feedback=`Ответ не покрыл все типы информации, прямо запрошенные пользователем: ${missingFacets.join('; ')}. Проверь вопрос ещё раз по источникам; добавь отдельные подтверждённые claims для пропущенных частей. Не заполняй пробел догадкой.`;
+          try{
+            const retried=await measureStage(trace,'evidenceAndAnswerMs',()=>askModel(question,answerSources,history,1,feedback,trace));
+            if(retried?.decision==='answer'){
+              const remaining=missingAnswerFacets(question,retried.claims);
+              if(remaining.length<missingFacets.length||(!retried.partial&&generated.partial)){
+                generated=retried;
+                missingFacets=remaining;
+              }
+            }
+          }catch(error){trace.completenessRetryFailure=safeFailureCode(error);}
+          if(missingFacets.length){generated.partial=true;generated.uncoveredFacets=missingFacets;}
+        }
       }
-      // Context and unrelated fragments never reach answer generation or unit routing.
-      sources=classification.direct;
-      const sourceUnits = [...new Set(sources.map(s=>s.unit))];
-      if(!sourceUnits.length||sourceUnits.some(x=>!x)){
-        await logEvent({outcome:'invalid_source_unit',unit:unit||null,sourceIds:sources.map(s=>s.id)});
-        return send(res,200,{id,status:'escalation',answer:'У найденного правила не указан центр компетенций или дирекция. Не буду переносить его на весь процесс. Хотите передать вопрос в службу качества?',citations:[],sources:[]});
+      if(!generated){status='escalation';trace.refusalReason=trace.refusalReason||'MODEL_NOT_CONFIGURED';answer='Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?';}
+      else if(generated.decision==='clarify'){
+        if(history.length>=2){status='escalation';trace.refusalReason='CLARIFICATION_LIMIT';answer='После двух уточнений я всё ещё не могу выбрать однозначное правило. Хотите передать вопрос специалисту службы качества?';}
+        else{status='clarify';trace.refusalReason='AMBIGUOUS_QUERY';answer=generated.clarifying_question;}
+      }else if(generated.decision==='no_answer'){
+        status='escalation';trace.refusalReason='NO_SUPPORTED_ANSWER';answer='В найденных материалах нет подтверждённого ответа именно на этот вопрос. Хотите отправить обращение в службу качества?';
+      }else{
+        answer=generated.answer;
+        if(generated.partial){
+          status='partial_answer';
+          const partialNote=generated.uncoveredFacets?.length
+            ?'Не все части вопроса удалось подтвердить по найденным источникам.'
+            :'Остальные утверждения не прошли проверку источников, поэтому я их не показываю.';
+          answer=`В документах удалось подтвердить только часть ответа. ${answer} ${partialNote}`;
+          trace.refusalReason='PARTIAL_VALIDATED_CLAIMS';
+          trace.rejectedClaimCodes=generated.rejected_claims;
+        }
+        const citedSources=generated.citation_refs.map(ref=>answerSources[ref-1]);
+        const citedUnits=[...new Set(citedSources.map(s=>s.unit).filter(Boolean))];
+        // Ask for a unit before exposing a cross-unit answer. This path uses one model hop instead of two.
+        if(!unit&&!compareAll&&!asksAcrossUnits&&citedUnits.length>1){
+          trace.refusalReason='UNIT_CLARIFICATION_REQUIRED';
+          return finish(200,{id,status:'clarify_unit',answer:'Порядок может отличаться между подразделениями. Для какого центра компетенций или дирекции ищем ответ?',options:citedUnits});
+        }
+        const requiredUnits=asksAcrossUnits?(searchUnits.length?searchUnits:[...new Set(docs.map(d=>d.unit))]):[];
+        const unresolvedUnits=requiredUnits.filter(named=>!citedUnits.includes(named));
+        if(unresolvedUnits.length){
+          trace.refusalReason='MISSING_REQUIRED_UNIT_EVIDENCE';
+          status='escalation';answer='Нашла подтверждённые фрагменты не по всем указанным подразделениям. По '+unresolvedUnits.join(', ')+' ответа в найденных материалах нет. Хотите передать вопрос в службу качества?';
+        }
       }
-      const unresolvedUnits=asksAcrossUnits?searchUnits.filter(named=>!sourceUnits.includes(named)):[];
-      if(unresolvedUnits.length){
-        await logEvent({outcome:'no_source',unit:null,sourceIds:sources.map(s=>s.id)});
-        const found=sourceUnits.join(', ')||'ни одного';
-        return send(res,200,{id,status:'escalation',answer:`Нашла подходящие фрагменты только для: ${found}. По ${unresolvedUnits.join(', ')} подтверждённого фрагмента не нашла, поэтому не буду объединять правила в общий ответ. Хотите передать вопрос в службу качества?`,citations:sources.map((s,i)=>({ref:i+1,title:s.title,unit:s.unit,section:s.section,url:s.url})),question,unit:null,history});
-      }
-      const questionTerms = [...new Set(normalize([question,...history].join(' ')).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
-      const experienceMatches = verifiedExperiences.filter(x => {
-        if (!questionTerms.length || x.status !== 'approved' || !x.unit || !sourceUnits.includes(x.unit)) return false;
+      const citeRefs=generated?.decision==='answer'?generated.citation_refs:[];
+      const citations=citeRefs.map(ref=>{const s=answerSources[ref-1];return {ref,title:s.title,unit:s.unit,section:s.section,url:s.url};});
+      const citedUnits=new Set(citations.map(c=>c.unit).filter(Boolean));
+      const questionTerms=[...new Set(normalize([question,...history].join(' ')).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
+      const experienceMatches=verifiedExperiences.filter(x=>{
+        if(!questionTerms.length||x.status!=='approved'||!x.unit||!citedUnits.has(x.unit))return false;
         const topicTerms=[...new Set(normalize(x.topic).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
         const hits=questionTerms.filter(t=>topicTerms.some(w=>tokenMatches(t,w))).length;
         return questionTerms.length>=2&&topicTerms.length>=2&&hits>=2&&hits/Math.min(questionTerms.length,topicTerms.length)>=0.5;
       });
-      let generated, answer, status = 'answered', modelNotice = '';
-      try {
-        generated = await askModel(question, sources, history);
-      }
-      catch(error) { console.warn(`Qwen answer rejected or unavailable: ${error.message}`); status = 'escalation'; modelNotice = 'Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?'; }
-      if (!generated) { status = 'escalation'; answer = 'Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?'; }
-      else if (generated.decision === 'answer' && !unit && !compareAll && !asksAcrossUnits && sourceUnits.length > 1) {
-        return send(res, 200, { id, status: 'clarify_unit', answer: 'Порядок может отличаться между подразделениями. Для какого центра компетенций или дирекции ищем ответ?', options: sourceUnits });
-      } else if (generated.decision === 'clarify') {
-        if (history.length >= 2) { status = 'escalation'; answer = 'После двух уточнений я всё ещё не могу выбрать однозначное правило. Хотите передать вопрос специалисту службы качества?'; }
-        else { status = 'clarify'; answer = generated.clarifying_question; }
-      } else if (generated.decision === 'no_answer') {
-        console.warn('No answer; final evidence sections:',sources.map(s=>`${s.id}:${s.section||'n/a'}`).join(','));
-        status = 'escalation'; answer = 'В найденных материалах нет подтверждённого ответа именно на этот вопрос. Хотите отправить обращение в службу качества?';
-      } else answer = generated.answer;
-      await logEvent({ outcome: status, unit: unit || null, sourceIds: sources.map(d=>d.id) });
-      const citeRefs = generated?.decision === 'answer' ? generated.citation_refs : (generated?.decision==='no_answer'?[]:sources.map((_,i)=>i+1));
-      const citations = citeRefs.map(ref=>{const s=sources[ref-1];return {ref,title:s.title,unit:s.unit,section:s.section,url:s.url};});
-      const citedUnits=new Set(citations.map(c=>c.unit).filter(Boolean));
       const answerTerms=[...new Set(normalize((generated?.claims||[]).map(c=>c.text).join(' ')).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
       const experiences=status==='answered'?experienceMatches.filter(x=>{
-        if(!citedUnits.has(x.unit)||answerTerms.length<2)return false;
+        if(answerTerms.length<2)return false;
         const topicTerms=[...new Set(normalize(x.topic).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
         const overlap=topicTerms.filter(t=>answerTerms.some(w=>tokenMatches(t,w))).length;
         return overlap>=2&&overlap/Math.min(topicTerms.length,answerTerms.length)>=0.5;
       }).map(x=>({text:x.text,source:x.source,unit:x.unit,approvedAt:x.approvedAt})):[];
-      return send(res, 200, { id, answer, modelNotice, citations, question, unit, history, experiences, status });
+      return finish(200,{id,answer,modelNotice,citations,question,unit,history,experiences,status,...(status==='partial_answer'?{partial:true}:{})});
     }
     if (req.method === 'POST' && url.pathname === '/api/feedback') {
       const data = await bodyJson(req);
