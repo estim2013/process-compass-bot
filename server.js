@@ -214,16 +214,25 @@ async function search(q, unit = '') {
       const similarity=compatibleVector?cosine(queryVector,compatibleVector):0;
       const hasVector=Boolean(compatibleVector);
       const phraseBoost=Math.min(1.8,phraseHits*0.6);
-      const score=hasVector?(hits.length*0.55+phraseBoost+Math.min(0.2,metaHits*0.05)+similarity*2.2):hits.length+phraseBoost+Math.min(0.3,metaHits*0.1);
-      const relevant=hasVector||score>=Math.min(0.8,terms.length);
-      if(relevant)matches.push({id:c.doc_id,title:c.title,unit:c.unit,process:c.process,version:c.version,url:c.url,excerpt:c.content,section:c.section,score,hasVector,coverage:hits.length/Math.max(1,terms.length)});
+      const lexicalScore=hits.length+phraseBoost+Math.min(0.4,metaHits*0.08);
+      if(lexicalScore>0||hasVector)matches.push({chunkId:c.id,id:c.doc_id,title:c.title,unit:c.unit,process:c.process,version:c.version,url:c.url,excerpt:c.content,section:c.section,score:0,lexicalScore,similarity,hasVector,coverage:hits.length/Math.max(1,terms.length)});
   }
-  matches.sort((a,b) => b.score - a.score);
   if (!matches.length) return [];
-  if(!queryVector&&matches[0].coverage<0.25)return [];
-  // Multi-part questions often need two adjacent sections with slightly different lexical scores.
-  const relevanceFloor = Math.max(matches[0].hasVector?0:0.8, matches[0].score - (matches[0].hasVector?3.5:2.2));
-  const relevant = matches.filter(m => m.score >= relevanceFloor);
+  // Rank lexical and semantic evidence independently, then fuse ranks so one score scale cannot drown out the other.
+  const lexical=matches.filter(m=>m.lexicalScore>0).sort((a,b)=>b.lexicalScore-a.lexicalScore);
+  const semantic=matches.filter(m=>m.hasVector).sort((a,b)=>b.similarity-a.similarity);
+  const ranks=new Map();
+  lexical.forEach((m,index)=>ranks.set(m.chunkId,{...ranks.get(m.chunkId),lexical:index+1}));
+  semantic.forEach((m,index)=>ranks.set(m.chunkId,{...ranks.get(m.chunkId),semantic:index+1}));
+  const relevant=matches.filter(m=>{
+    const rank=ranks.get(m.chunkId)||{};
+    return rank.lexical<=100||rank.semantic<=100;
+  });
+  for(const m of relevant){
+    const rank=ranks.get(m.chunkId)||{};
+    m.score=(rank.lexical?1/(60+rank.lexical):0)+(rank.semantic?1/(60+rank.semantic):0);
+  }
+  relevant.sort((a,b)=>b.score-a.score||b.lexicalScore-a.lexicalScore||b.similarity-a.similarity);
   // Keep the strongest evidence across documents, while allowing more than one section per source.
   const picked = [], perDoc = new Map(), seenSections = new Set();
   const addMatch=(m,requireNewSection)=>{
@@ -245,14 +254,17 @@ async function searchScope(q, units = []) {
 }
 function mergeSources(...groups) {
   const unique=new Map();
-  for(const source of groups.flat()){
-    const key=`${source.id}:${source.section||''}`;
-    const prior=unique.get(key);
-    if(!prior||source.score>prior.score)unique.set(key,source);
+  for(const group of groups){
+    group.forEach((source,index)=>{
+      const key=`${source.id}:${source.section||''}`;
+      const prior=unique.get(key),fused=(prior?.fused||0)+1/(60+index+1);
+      unique.set(key,{...((!prior||source.score>prior.score)?source:prior),fused,score:fused});
+    });
   }
-  const all=[...unique.values()], units=[...new Set(all.map(x=>x.unit))];
-  const first=units.map(unit=>all.filter(x=>x.unit===unit).sort((a,b)=>b.score-a.score)[0]);
-  return [...first,...all.filter(x=>!first.includes(x)).sort((a,b)=>b.score-a.score)].slice(0,20);
+  const all=[...unique.values()].sort((a,b)=>b.score-a.score);
+  const units=[...new Set(all.map(x=>x.unit))];
+  const first=units.map(unit=>all.find(x=>x.unit===unit));
+  return [...first,...all.filter(x=>!first.includes(x))].slice(0,20);
 }
 async function classifySources(question,candidates) {
   if(!candidates.length)return {direct:[]};
