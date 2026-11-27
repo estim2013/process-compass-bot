@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.git
+node_modules
+state
+data/mvp.sqlite
+data/mvp.sqlite-wal
+data/mvp.sqlite-shm
+data/logs.jsonl
+data/quality_queue.json
+data/verified_experiences.json
+frame_*.jpg

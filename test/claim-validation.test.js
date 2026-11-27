@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeComparable, validateClaim } from '../lib/claim-validation.js';
+import { PipelineFailure } from '../lib/pipeline-failure.js';
 
 test('preserves working-day qualifiers in Russian inflections', () => {
   assert.throws(
@@ -18,6 +19,17 @@ test('keeps decimal values as one numeric fact', () => {
   assert.equal(normalizeComparable('1,5 дня'), '1.5 дня');
   assert.doesNotThrow(() => validateClaim('Срок 1,5 месяца', 'Срок 1.5 месяца'));
   assert.throws(() => validateClaim('Срок 5 дней', 'Срок 1.5 рабочих дня'), /Число 5/);
+});
+
+test('classifies deterministic claim validation failures without exposing claim text', () => {
+  assert.throws(
+    () => validateClaim('Срок 5 дней', 'Срок 3 рабочих дня'),
+    error => error instanceof PipelineFailure && error.stage === 'claim_validation' && error.code === 'numeric_mismatch'
+  );
+  assert.throws(
+    () => validateClaim('Ответьте за 3 дня', 'Ответьте в течение трех рабочих дней'),
+    error => error instanceof PipelineFailure && error.stage === 'claim_validation' && error.code === 'working_day_condition_mismatch'
+  );
 });
 
 test('does not mistake the noun “обязанности” for a mandatory instruction', () => {
@@ -44,5 +56,12 @@ test('recognizes number words after ё normalization', () => {
 test('preserves conditional rules', () => {
   assert.throws(() => validateClaim('Отправьте заявку', 'Если данные неполные, отправьте заявку на уточнение'), /условие/);
   assert.doesNotThrow(() => validateClaim('Если данные неполные, отправьте заявку', 'Если данные неполные, отправьте заявку на уточнение'));
+  assert.doesNotThrow(() => validateClaim('При нарушении SLA заявка эскалируется руководителю', 'Если время реакции нарушено, заявка передается руководителю'));
+  assert.throws(() => validateClaim('Приоритет не меняется', 'Приоритет не меняется, если SLA нарушен'), /условие/);
   assert.throws(() => validateClaim('Отправьте заявку при условии готовности данных', 'Подавать только если данные готовы'), /только если/);
 });
+
+test('distinguishes inability from a policy prohibition', () => {
+  assert.doesNotThrow(() => validateClaim('Когда в проекте есть риск, который нельзя ни исключить, ни принять, РП эскалирует его', 'Если риск не может быть исключён или принят, РП эскалирует его на SS'));
+});
+

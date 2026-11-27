@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+state/
+data/
+node_modules/
+eval-*.json
+eval-*.jsonl
+frame_*.jpg
+*.sqlite
+*.sqlite-*
