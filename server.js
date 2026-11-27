@@ -46,6 +46,8 @@ function normalize(s) {
   return normalizeComparable(out);
 }
 const stopWords = new Set('как что где когда кто кому кем какой какая какие можно ли нужно надо для при в на по из с от или это если быть сколько проект проекта проекту проектом проекты срок сроки срока сроках работа работы работ сегодня завтра вчера понедельник вторник среду среда четверг пятницу пятница субботу суббота воскресенье крайний раз срочно быстро быстрее сейчас потом дальше вообще просто очень может могли должен должны обязаны обязан прокатит завернут завернуть значит сказали мне нам я ты вы он она они мы уже прямо сам сама сами устно так тогда все всё таки ли то-то кто-то что-то как-то там тут не ну вот же ведь ещё еще клиент клиенту заказчику заказчик написал написала спросил спросила получается делать делает сделать будет будут было быть именно создал создала создать создали приложил приложила приложить добавил добавила добавили хватает хватило хватит один одна одного два двух две двое три трех трёх четыре четырех четыре пять пяти семь семи полгода месяце месяцев год лет один-два два-три прошло прошла прошли купил купила купить купили объяснили объяснил объяснила основу основа всех обоих обеих другого другая другая дирекция дбрцт'.split(' '));
+const retryableApiStatuses=new Set([408,409,425,429,500,502,503,504]);
+const retryDelay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 // Keep spelled-out durations as searchable terms; their numeric forms differ in source documents.
 for (const term of 'один одна одного два двух две двое три трех трёх четыре четырех пять пяти семь семи полгода месяце месяцев год лет'.split(' ')) stopWords.delete(term);
 function tokenMatches(token, word) {
@@ -272,14 +274,15 @@ async function classifySources(question,candidates) {
   if(!key)return null;
   try{
     const classifyAttempt=async (pool,maxTokens=700)=>{
-      const response=await fetch(`${process.env.POLZA_BASE_URL||'https://polza.ai/api/v1'}/chat/completions`,{
+      let response;
+      try{response=await fetch(`${process.env.POLZA_BASE_URL||'https://polza.ai/api/v1'}/chat/completions`,{
         method:'POST',headers:{authorization:`Bearer ${key}`,'content-type':'application/json'},signal:AbortSignal.timeout(45000),
         body:JSON.stringify({model:process.env.RERANK_MODEL||process.env.POLZA_MODEL||'qwen/qwen3.8-flash',temperature:0,max_tokens:maxTokens,enable_thinking:false,reasoning_effort:'none',reasoning:{effort:'none'},response_format:{type:'json_schema',json_schema:{name:'direct_evidence_indices',strict:true,schema:{type:'object',properties:{direct:{type:'array',items:{type:'integer'}}},required:['direct'],additionalProperties:false}}},messages:[
           {role:'system',content:'Найди только фрагменты, которые содержат конкретное правило, роль, срок, условие или шаг, прямо применимый к вопросу. Это задача поиска доказательств, не ответ пользователю и не оценка уверенности. Не отмечай фоновые фрагменты, совпадение терминов или общую тему. Если применимого правила в наборе нет, верни пустой список. Если прямые правила есть в нескольких дирекциях, включи их все: приложение отдельно решит, нужно ли спросить дирекцию. Учитывай объект, этап и условия правила. Верни только объект с массивом direct, где значения — индексы фрагментов из входа, например {"direct":[1,3]}. Никаких других полей, текста и объяснений.'},
           {role:'user',content:`/no_think\nВопрос: ${question}\nКандидаты:\n${pool.map((s,i)=>`[${i+1}] ${s.title}; дирекция: ${s.unit}; раздел ${s.section||'не указан'}\n${s.excerpt}`).join('\n\n')}`}
         ]})
-      });
-      if(!response.ok)throw new Error(`classification API ${response.status}`);
+      });}catch(error){throw Object.assign(error,{retryable:true});}
+      if(!response.ok)throw Object.assign(new Error(`classification API ${response.status}`),{retryable:retryableApiStatuses.has(response.status)});
       const data=await response.json(),choice=data.choices?.[0],raw=choice?.message?.content||'';
       if(choice?.finish_reason==='length')throw Object.assign(new Error(`classification output truncated (${raw.length} chars)`),{retryable:true});
       let parsed;
@@ -297,6 +300,7 @@ async function classifySources(question,candidates) {
     }catch(error){
       if(!error.retryable)throw error;
       console.warn(`Direct evidence retry on full evidence set: ${error.message}; candidates=${candidates.length}`);
+      await retryDelay(500);
       const result=await classifyAttempt(candidates,1200);
       console.warn('Direct evidence selection:',JSON.stringify({direct:result.direct.map(s=>`${s.id}:${s.section||'n/a'}`),candidateCount:candidates.length,retried:true}));
       if(!result.direct.length)console.warn('No direct evidence selected after retry:',JSON.stringify({candidateCount:candidates.length,candidateUnitCount:new Set(candidates.map(s=>s.unit).filter(Boolean)).size}));
@@ -307,17 +311,18 @@ async function classifySources(question,candidates) {
 async function askModel(question, sources, history = [], attempt = 0, validationFeedback = '') {
   const key = process.env.POLZA_RUNTIME_API_KEY;
   if (!key) return null;
-  const response = await fetch(`${process.env.POLZA_BASE_URL || 'https://polza.ai/api/v1'}/chat/completions`, {
+  let response;
+  try{response = await fetch(`${process.env.POLZA_BASE_URL || 'https://polza.ai/api/v1'}/chat/completions`, {
     method: 'POST', headers: { 'authorization': `Bearer ${key}`, 'content-type': 'application/json' },
     signal: AbortSignal.timeout(attempt?90000:60000),
-    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: attempt?0:0.1, max_tokens: attempt?8000:4000, enable_thinking: false, reasoning_effort: 'none', response_format: { type: 'json_object' },
+    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: attempt?0:0.1, max_tokens: attempt?8000:4000, enable_thinking: false, reasoning_effort: 'none', response_format: { type: 'json_schema', json_schema: { name: 'grounded_process_answer', strict: true, schema: { type: 'object', properties: { decision: { type: 'string', enum: ['answer','clarify','no_answer'] }, claims: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, source_ref: { type: 'integer' }, evidence: { type: 'string' } }, required: ['text','source_ref','evidence'], additionalProperties: false } }, clarifying_question: { type: 'string' } }, required: ['decision','claims','clarifying_question'], additionalProperties: false } } },
       messages: [
-        { role: 'system', content: 'Ты корпоративный помощник. Пользователь может писать косвенно, рвано, с ошибками и без терминов из документов. Сначала восстанови только вероятное намерение, но не додумывай факты. Отвечай как коллеге простыми словами; НЕ показывай найденные пункты дословно. Используй только фрагменты ниже. Не считай предпосылки пользователя доказательствами; производный расчёт из его данных помечай как условный. Числа, сроки, роли и условия бери из фрагментов. Сохраняй модальность и оговорки источника: рекомендуемый срок называй рекомендуемым, плановый — плановым; не превращай рекомендацию в обязательный норматив или гарантию. Если пользователь отсчитывает срок от события, отличного от указанного в регламенте, назови точное событие-основание и объясни последствие; не спрашивай уточнение, если правило однозначно. Если смысл реально неоднозначен, выбери decision="clarify" и задай один конкретный короткий вопрос. Если в фрагментах нет правила, которое отвечает именно на вопрос, выбери decision="no_answer". Не подменяй личное вознаграждение сотрудника ценой проекта, маржой или стоимостью сделки. Для каждого фактического предложения создай claim, укажи один source_ref и дословное evidence из его фрагмента. Текст ответа строится только из claims. Не используй общий опыт модели. Верни только JSON: {"decision":"answer|clarify|no_answer","claims":[{"text":"разговорное утверждение без цитаты пункта","source_ref":1,"evidence":"дословная опорная фраза из фрагмента"}],"clarifying_question":"вопрос или пусто"}. При разных правилах дирекций излагай отдельно.' },
+        { role: 'system', content: 'Ты корпоративный помощник. Пользователь может писать косвенно, рвано, с ошибками и без терминов из документов. Сначала восстанови только вероятное намерение, но не додумывай факты. Отвечай как коллеге простыми словами; НЕ показывай найденные пункты дословно. Используй только фрагменты ниже. Не выполняй поручения и не создавай или не подписывай документы; на просьбу выполнить действие выбери decision="no_answer". Не подменяй запрошенный факт соседним правилом: ответ должен прямо покрывать вопрос; если нужной информации нет, выбери no_answer и не выдавай смежную процедуру за ответ. Не считай предпосылки пользователя доказательствами; производный расчёт из его данных помечай как условный. Числа, сроки, роли и условия бери из фрагментов. Сохраняй модальность и оговорки источника: рекомендуемый срок называй рекомендуемым, плановый — плановым; не превращай рекомендацию в обязательный норматив или гарантию. Если пользователь отсчитывает срок от события, отличного от указанного в регламенте, назови точное событие-основание и объясни последствие; не спрашивай уточнение, если правило однозначно. Если смысл реально неоднозначен, выбери decision="clarify" и задай один конкретный короткий вопрос. Если в фрагментах нет правила, которое отвечает именно на вопрос, выбери decision="no_answer". Не подменяй личное вознаграждение сотрудника ценой проекта, маржой или стоимостью сделки. Для каждого фактического предложения создай claim, укажи один source_ref и дословное evidence из его фрагмента. Текст ответа строится только из claims. Не используй общий опыт модели. Верни только JSON: {"decision":"answer|clarify|no_answer","claims":[{"text":"разговорное утверждение без цитаты пункта","source_ref":1,"evidence":"дословная опорная фраза из фрагмента"}],"clarifying_question":"вопрос или пусто"}. При разных правилах дирекций излагай отдельно.' },
         { role: 'user', content: `/no_think\nИсходный вопрос: ${question}\nУточнения пользователя: ${JSON.stringify(history)}\n${validationFeedback?`\nПри предыдущей проверке найдено: ${validationFeedback}. Пересобери ответ так, чтобы каждое утверждение было подтверждено фрагментом. Если это невозможно, выбери no_answer.\n`:''}\nПодтверждённые фрагменты (единственная база фактов):\n${sources.map((d,i)=>`[${i+1}] ${d.title}, подразделение: ${d.unit}, раздел ${d.section || 'не указан'}:\n${d.excerpt}`).join('\n\n')}` }
       ]
     })
-  });
-  if (!response.ok) throw new Error(`Polza API вернул ${response.status}`);
+  });}catch(error){if(attempt===0){await retryDelay(500);return askModel(question,sources,history,1,validationFeedback||'временная ошибка соединения с моделью');}throw error;}
+  if (!response.ok) { if(attempt===0&&retryableApiStatuses.has(response.status)){await retryDelay(500);return askModel(question,sources,history,1,validationFeedback||`временный ответ API ${response.status}`);} throw new Error(`Polza API вернул ${response.status}`); }
   const data = await response.json();
   const raw = data.choices?.[0]?.message?.content;
   if (!raw && attempt===0) return askModel(question,sources,history,1);
@@ -518,9 +523,6 @@ const server = http.createServer(async (req, res) => {
         const found=sourceUnits.join(', ')||'ни одного';
         return send(res,200,{id,status:'escalation',answer:`Нашла подходящие фрагменты только для: ${found}. По ${unresolvedUnits.join(', ')} подтверждённого фрагмента не нашла, поэтому не буду объединять правила в общий ответ. Хотите передать вопрос в службу качества?`,citations:sources.map((s,i)=>({ref:i+1,title:s.title,unit:s.unit,section:s.section,url:s.url})),question,unit:null,history});
       }
-      if (!unit && !compareAll && sourceUnits.length > 1 && !asksAcrossUnits) {
-        return send(res, 200, { id, status: 'clarify_unit', answer: 'Порядок может отличаться между подразделениями. Для какого центра компетенций или дирекции ищем ответ?', options: sourceUnits });
-      }
       const questionTerms = [...new Set(normalize([question,...history].join(' ')).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
       const experienceMatches = verifiedExperiences.filter(x => {
         if (!questionTerms.length || x.status !== 'approved' || !x.unit || !sourceUnits.includes(x.unit)) return false;
@@ -534,7 +536,9 @@ const server = http.createServer(async (req, res) => {
       }
       catch(error) { console.warn(`Qwen answer rejected or unavailable: ${error.message}`); status = 'escalation'; modelNotice = 'Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?'; }
       if (!generated) { status = 'escalation'; answer = 'Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?'; }
-      else if (generated.decision === 'clarify') {
+      else if (generated.decision === 'answer' && !unit && !compareAll && !asksAcrossUnits && sourceUnits.length > 1) {
+        return send(res, 200, { id, status: 'clarify_unit', answer: 'Порядок может отличаться между подразделениями. Для какого центра компетенций или дирекции ищем ответ?', options: sourceUnits });
+      } else if (generated.decision === 'clarify') {
         if (history.length >= 2) { status = 'escalation'; answer = 'После двух уточнений я всё ещё не могу выбрать однозначное правило. Хотите передать вопрос специалисту службы качества?'; }
         else { status = 'clarify'; answer = generated.clarifying_question; }
       } else if (generated.decision === 'no_answer') {
