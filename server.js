@@ -270,14 +270,15 @@ async function rerankSources(question,candidates,requiredUnits=[]) {
     if(!response.ok)return candidates.slice(0,4);
     const raw=(await response.json()).choices?.[0]?.message?.content||'';
     const parsed=JSON.parse(raw);
-    const order=(Array.isArray(parsed.ranked)?parsed.ranked:[]).filter(x=>Number.isInteger(x.i)&&x.i>=1&&x.i<=candidates.length&&Number(x.score)>=4).sort((a,b)=>Number(b.score)-Number(a.score)).map(x=>candidates[x.i-1]);
+    if(!Array.isArray(parsed.ranked))return candidates.slice(0,4);
+    const order=parsed.ranked.filter(x=>Number.isInteger(x.i)&&x.i>=1&&x.i<=candidates.length&&Number(x.score)>=4).sort((a,b)=>Number(b.score)-Number(a.score)).map(x=>candidates[x.i-1]);
     console.warn('Rerank selected:',order.map(s=>`${s.id}:${s.section||'n/a'}`).join(','));
-    if(!order.length)return candidates.slice(0,4);
+    if(!order.length)return []; // A valid ranking with no qualifying chunks means there is no grounded context.
     const selected=[];
     for(const unit of requiredUnits){const match=order.find(x=>x.unit===unit);if(match&&!selected.includes(match))selected.push(match);}
     const limit=Math.min(candidates.length,Math.max(4,requiredUnits.length*2));
     for(const item of order)if(selected.length<limit&&!selected.includes(item))selected.push(item);
-    return selected.length?selected:candidates.slice(0,4);
+    return selected;
   }catch{return candidates.slice(0,4);}
 }
 async function askModel(question, sources, history = [], attempt = 0, validationFeedback = '') {
@@ -459,12 +460,14 @@ const server = http.createServer(async (req, res) => {
         }catch{/* Keep the retrieval-only path available if query rewriting fails. */}
       }
       if(sources.length>3)sources=await rerankSources(question,sources,searchUnits);
+      const asksAcrossUnits=explicitUnits.length>1||compareAll;
       if (!sources.length) {
         await logEvent({ outcome: 'no_source', unit: unit || null });
-        return send(res, 200, { id, answer: 'В предоставленных материалах не нашла подтверждённого ответа. Хотите отправить вопрос в службу качества?', citations: [], sources: [], status: 'escalation' });
+        const requestedUnits=asksAcrossUnits?(searchUnits.length?searchUnits:[...new Set(docs.map(d=>d.unit))]):[];
+        const scopeNote=requestedUnits.length?` по указанным подразделениям (${requestedUnits.join('; ')})`:'';
+        return send(res, 200, { id, answer: `В предоставленных материалах${scopeNote} не нашла подтверждённого ответа. Хотите отправить вопрос в службу качества?`, citations: [], sources: [], status: 'escalation' });
       }
       const sourceUnits = [...new Set(sources.map(s=>s.unit))];
-      const asksAcrossUnits = explicitUnits.length > 1 || compareAll;
       const unresolvedUnits=asksAcrossUnits?searchUnits.filter(named=>!sourceUnits.includes(named)):[];
       if(unresolvedUnits.length){
         await logEvent({outcome:'no_source',unit:null,sourceIds:sources.map(s=>s.id)});
