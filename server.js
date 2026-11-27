@@ -271,8 +271,9 @@ async function rerankSources(question,candidates,requiredUnits=[]) {
     const raw=(await response.json()).choices?.[0]?.message?.content||'';
     const parsed=JSON.parse(raw);
     if(!Array.isArray(parsed.ranked))return candidates.slice(0,4);
-    const order=parsed.ranked.filter(x=>Number.isInteger(x.i)&&x.i>=1&&x.i<=candidates.length&&Number(x.score)>=4).sort((a,b)=>Number(b.score)-Number(a.score)).map(x=>candidates[x.i-1]);
-    console.warn('Rerank selected:',order.map(s=>`${s.id}:${s.section||'n/a'}`).join(','));
+    const ranked=parsed.ranked.filter(x=>Number.isInteger(x.i)&&x.i>=1&&x.i<=candidates.length&&Number.isFinite(Number(x.score))).sort((a,b)=>Number(b.score)-Number(a.score));
+    const order=ranked.filter(x=>Number(x.score)>=4).map(x=>candidates[x.i-1]);
+    console.warn('Rerank selected:',ranked.map(x=>`${candidates[x.i-1].id}:${candidates[x.i-1].section||'n/a'}=${Number(x.score)}`).join(','));
     if(!order.length)return []; // A valid ranking with no qualifying chunks means there is no grounded context.
     const selected=[];
     for(const unit of requiredUnits){const match=order.find(x=>x.unit===unit);if(match&&!selected.includes(match))selected.push(match);}
