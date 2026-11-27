@@ -1,0 +1,24 @@
+services:
+  process-compass:
+    build: .
+    image: process-compass-mvp:latest
+    container_name: process-compass-mvp
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      STATE_DIR: /app/state
+      DB_PATH: /app/state/mvp.sqlite
+    ports:
+      - "3210:3000"
+    volumes:
+      - ./state:/app/state
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
