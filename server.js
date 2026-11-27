@@ -334,7 +334,8 @@ async function askModel(question, sources, history = [], attempt = 0, validation
     if(typeof result.intent_clear!=='boolean'||!result.intent_summary?.trim())throw new Error('Нет подтверждённой формулировки намерения');
     if(!result.intent_clear&&result.decision!=='clarify')throw new Error('Ответ сформирован при неясном намерении');
     if (result.decision === 'answer') {
-      const claims = Array.isArray(result.claims) ? result.claims.slice(0,6) : [];
+      const claims = Array.isArray(result.claims) ? result.claims : [];
+      if(claims.length>6)throw new Error('Ответ содержит слишком много утверждений для проверки');
       if (!claims.length) throw new Error('Ответ модели не содержит проверяемых утверждений');
       for (const claim of claims) {
         const ref=claim.source_ref, evidence=String(claim.evidence||'').trim();
