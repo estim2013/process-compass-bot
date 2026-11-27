@@ -6,6 +6,7 @@ import tls from 'node:tls';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { normalizeComparable, validateClaim } from './lib/claim-validation.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const chunkerVersion = 'section-overlap-v2';
@@ -25,6 +26,7 @@ const docs = await Promise.all(registry.map(async d => {
   catch { return { ...meta, text: '' }; }
 }));
 const glossary = JSON.parse(await readFile(path.join(root, 'data/glossary.json'), 'utf8'));
+const uppercaseOnlyGlossary = new Set(Object.keys(glossary).filter(term => [...term].length <= 2 && /\p{L}/u.test(term)));
 let verifiedExperiences = [];
 try { verifiedExperiences = JSON.parse(await readFile(path.join(stateDir, 'verified_experiences.json'), 'utf8')); } catch {}
 const port = Number(process.env.PORT || 3000);
@@ -34,12 +36,14 @@ function send(res, status, body, type = 'application/json; charset=utf-8') {
   res.end(type.startsWith('application/json') ? JSON.stringify(body) : body);
 }
 function normalize(s) {
-  let out = String(s || '').toLowerCase().replace(/ё/g, 'е');
+  let out = String(s || '').replace(/ё/gi, match => match === 'Ё' ? 'Е' : 'е');
   for (const [short, expansion] of Object.entries(glossary)) {
     const token = short.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    out = out.replace(new RegExp(`(?<![\\p{L}\\p{N}])${token}(?![\\p{L}\\p{N}])`, 'gu'), match => `${match} ${expansion.toLowerCase()}`);
+    const uppercaseOnly = uppercaseOnlyGlossary.has(short);
+    const pattern = uppercaseOnly ? short.toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : token;
+    out = out.replace(new RegExp(`(?<![\\p{L}\\p{N}])${pattern}(?![\\p{L}\\p{N}])`, uppercaseOnly ? 'gu' : 'giu'), match => `${match} ${expansion}`);
   }
-  return out.replace(/[-‐‑‒–—]/g,' ').replace(/[^\p{L}\p{N}\s]/gu, ' ');
+  return normalizeComparable(out);
 }
 const stopWords = new Set('как что где когда кто кому кем какой какая какие можно ли нужно надо для при в на по из с от или это если быть сколько проект проекта проекту проектом проекты срок сроки срока сроках работа работы работ сегодня завтра вчера понедельник вторник среду среда четверг пятницу пятница субботу суббота воскресенье крайний раз срочно быстро быстрее сейчас потом дальше вообще просто очень может могли должен должны обязаны обязан прокатит завернут завернуть значит сказали мне нам я ты вы он она они мы уже прямо сам сама сами устно так тогда все всё таки ли то-то кто-то что-то как-то там тут не ну вот же ведь ещё еще клиент клиенту заказчику заказчик написал написала спросил спросила получается делать делает сделать будет будут было быть именно создал создала создать создали приложил приложила приложить добавил добавила добавили хватает хватило хватит один одна одного два двух две двое три трех трёх четыре четырех четыре пять пяти семь семи полгода месяце месяцев год лет один-два два-три прошло прошла прошли купил купила купить купили объяснили объяснил объяснила основу основа всех обоих обеих другого другая другая дирекция дбрцт'.split(' '));
 // Keep spelled-out durations as searchable terms; their numeric forms differ in source documents.
@@ -53,46 +57,15 @@ function tokenMatches(token, word) {
   return word===token||stem(word)===stem(token);
 }
 function unitsMentioned(text) {
-  const words=normalize(text).split(/\s+/).filter(Boolean);
+  const words=normalizeComparable(text).split(/\s+/).filter(Boolean);
   const units=[...new Set(registry.map(d=>d.unit))];
   return units.filter(unit=>registry.filter(d=>d.unit===unit).some(doc=>{
     const aliases=[unit,...(doc.aliases||[])];
     return aliases.some(alias=>{
-      const parts=normalize(alias).split(/\s+/).filter(Boolean);
+      const parts=normalizeComparable(alias).split(/\s+/).filter(Boolean);
       return parts.length>0&&parts.every(part=>words.some(word=>tokenMatches(part,word)));
     });
   }));
-}
-function numericFacts(text) {
-  const value=normalize(String(text||'').replace(/^\s*\d+(?:\.\d+)*\.?\s+/,' '));
-  const facts=new Set((value.match(/\b\d+(?:[.,]\d+)?\b/g)||[]).map(x=>x.replace(',','.')));
-  const words={
-    'один':'1','одна':'1','одну':'1','одного':'1','одном':'1','одной':'1',
-    'два':'2','две':'2','двух':'2','двумя':'2',
-    'три':'3','трех':'3','трёх':'3','трем':'3','тремя':'3',
-    'четыре':'4','четырех':'4','четырём':'4','четырьмя':'4',
-    'пять':'5','пяти':'5','пятью':'5',
-    'шесть':'6','шести':'6','шестью':'6',
-    'семь':'7','семи':'7','семью':'7',
-    'восемь':'8','восьми':'8','девять':'9','девяти':'9','десять':'10','десяти':'10'
-  };
-  for(const word of value.split(/\s+/))if(words[word])facts.add(words[word]);
-  if(/полгода/.test(value))facts.add('6');
-  return facts;
-}
-function validateClaim(claim, sourceText) {
-  const statement=normalize(claim), evidence=normalize(sourceText);
-  const sourceNumbers=numericFacts(sourceText);
-  for(const n of numericFacts(claim))if(!sourceNumbers.has(n))throw new Error(`Число ${n} в ответе не подтверждено опорным фрагментом`);
-  if(/рекоменд|желательно|целесообразно/.test(evidence)&&/обязан|обязательн|должен|должна|должны|необходимо|требуется/.test(statement))
-    throw new Error('Ответ превратил рекомендацию источника в обязательное требование');
-  if(/рабоч\w*\s+дн/.test(evidence)&&/\bдн\w*/.test(statement)&&!/рабоч\w*/.test(statement))
-    throw new Error('В ответе потеряно условие «рабочие дни»');
-  if(/только если|при условии|\bесли\b/.test(evidence)&&!/только если|при условии|\bесли\b/.test(statement))
-    throw new Error('В ответе пропущено условие применимости правила');
-  const sourceProhibits=/не допуска|нельзя|запрещ|не должен|не должна|не обязател/.test(evidence);
-  const claimProhibits=/не допуска|нельзя|запрещ|не должен|не должна|не обязател/.test(statement);
-  if(sourceProhibits!==claimProhibits)throw new Error('Нельзя подтвердить модальность или отрицание ответа');
 }
 function sections(d) {
   const lines = d.text.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
@@ -336,8 +309,8 @@ async function askModel(question, sources, history = [], attempt = 0, validation
         const ref=claim.source_ref, evidence=String(claim.evidence||'').trim();
         const evidenceWords=normalize(evidence).split(/\s+/).filter(word=>word.length>=3);
         if (!claim.text?.trim() || !Number.isInteger(ref) || ref<1 || ref>sources.length || evidenceWords.length<3) throw new Error('Не хватает подтверждения для ответа');
-        const normalizedEvidence=normalize(evidence).replace(/\s+/g,' ').trim();
-        const normalizedSource=normalize(sources[ref-1].excerpt).replace(/\s+/g,' ').trim();
+        const normalizedEvidence=normalizeComparable(evidence);
+        const normalizedSource=normalizeComparable(sources[ref-1].excerpt);
         if (!normalizedSource.includes(normalizedEvidence)) throw new Error('Опора ответа не найдена в документе');
         validateClaim(claim.text,evidence);
       }
@@ -368,14 +341,21 @@ async function expandSearch(question, history = []) {
   const result = JSON.parse(raw || '{}');
   return { terms: Array.isArray(result.search_terms) ? result.search_terms.filter(x=>typeof x==='string').slice(0,6).map(x=>x.slice(0,60)) : [], clarification: String(result.clarifying_question||'').slice(0,250) };
 }
-async function logEvent(event) {
+let logWriteQueue=Promise.resolve();
+function logEvent(event) {
+  const operation=logWriteQueue.then(async()=>{
   const file = path.join(stateDir, 'logs.jsonl');
-  let current = [];
-  try { current = (await readFile(file, 'utf8')).split(/\r?\n/).filter(Boolean).map(JSON.parse); } catch {}
+  let raw='';
+  try { raw=await readFile(file, 'utf8'); } catch {}
+  let current=[];
+  for(const line of raw.split(/\r?\n/).filter(Boolean))try{current.push(JSON.parse(line));}catch{}
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
   current = current.filter(e => Date.parse(e.at) >= cutoff);
   current.push({ at: new Date().toISOString(), ...event });
   await writeFile(file, current.map(e=>JSON.stringify(e)).join('\n') + '\n');
+  });
+  logWriteQueue=operation.catch(()=>{});
+  return operation;
 }
 async function bodyJson(req) {
   let body = ''; for await (const chunk of req) body += chunk;
@@ -468,20 +448,6 @@ const server = http.createServer(async (req, res) => {
       const explicitUnits=unitsMentioned([question,...history].join(' '));
       const searchUnits=explicitUnits.length>1?explicitUnits:(unit?[unit]:explicitUnits);
       let searchQuestion = [question, ...history].filter(Boolean).join(' ');
-      const normalizedQuestion = normalize(searchQuestion);
-      const experienceTerms=[...new Set(normalizedQuestion.split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
-      const earlyExperienceMatches=verifiedExperiences.filter(x=>{
-        if(!experienceTerms.length||x.status!=='approved'||(unit&&x.unit&&x.unit!==unit))return false;
-        const topicTerms=[...new Set(normalize(x.topic).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
-        const hits=experienceTerms.filter(t=>topicTerms.some(w=>tokenMatches(t,w))).length;
-        return hits>=2&&hits/Math.max(1,Math.min(experienceTerms.length,topicTerms.length))>=0.5;
-      });
-      if(earlyExperienceMatches.length){
-        const expUnits=[...new Set(earlyExperienceMatches.map(x=>x.unit).filter(Boolean))];
-        if(!unit&&!compareAll&&expUnits.length>1)return send(res,200,{id:randomUUID(),status:'clarify_unit',answer:'Подтверждённые ответы различаются по подразделениям. Где вы работаете?',options:expUnits});
-        await logEvent({outcome:'verified_experience',unit:unit||null});
-        return send(res,200,{id:randomUUID(),status:'experience_only',answer:earlyExperienceMatches[0].text,experiences:earlyExperienceMatches.map(x=>({text:x.text,source:x.source})),citations:[]});
-      }
       const id = randomUUID();
       let sources=await searchScope(searchQuestion,searchUnits);
       let retrievalExpanded=false,expansion=null;
@@ -493,20 +459,7 @@ const server = http.createServer(async (req, res) => {
         }catch{/* Keep the retrieval-only path available if query rewriting fails. */}
       }
       if(sources.length>3)sources=await rerankSources(question,sources,searchUnits);
-      const questionTerms = [...new Set(normalize([question,...history].join(' ')).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
-      const experienceMatches = verifiedExperiences.filter(x => {
-        if (!questionTerms.length || x.status !== 'approved' || (unit && x.unit && x.unit !== unit)) return false;
-        const text = normalize(`${x.topic} ${x.text}`).split(/\s+/);
-        const hits = questionTerms.filter(t=>text.some(w=>tokenMatches(t,w))).length;
-        return questionTerms.length >= 2 && hits >= 2;
-      });
       if (!sources.length) {
-        if (experienceMatches.length) {
-          const expUnits = [...new Set(experienceMatches.map(x=>x.unit).filter(Boolean))];
-          if (!unit && !compareAll && expUnits.length > 1) return send(res, 200, { id, status: 'clarify_unit', answer: 'Подтверждённые ответы различаются по подразделениям. Где вы работаете?', options: expUnits });
-          await logEvent({ outcome: 'verified_experience', unit: unit || null });
-          return send(res, 200, { id, status: 'experience_only', answer: experienceMatches[0].text, experiences: experienceMatches.map(x=>({text:x.text,source:x.source})), citations: [] });
-        }
         await logEvent({ outcome: 'no_source', unit: unit || null });
         return send(res, 200, { id, answer: 'В предоставленных материалах не нашла подтверждённого ответа. Хотите отправить вопрос в службу качества?', citations: [], sources: [], status: 'escalation' });
       }
@@ -521,6 +474,13 @@ const server = http.createServer(async (req, res) => {
       if (!unit && !compareAll && sourceUnits.length > 1 && !asksAcrossUnits) {
         return send(res, 200, { id, status: 'clarify_unit', answer: 'Порядок может отличаться между подразделениями. Для какого центра компетенций или дирекции ищем ответ?', options: sourceUnits });
       }
+      const questionTerms = [...new Set(normalize([question,...history].join(' ')).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
+      const experienceMatches = verifiedExperiences.filter(x => {
+        if (!questionTerms.length || x.status !== 'approved' || !x.unit || !sourceUnits.includes(x.unit)) return false;
+        const topicTerms=[...new Set(normalize(x.topic).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
+        const hits=questionTerms.filter(t=>topicTerms.some(w=>tokenMatches(t,w))).length;
+        return questionTerms.length>=2&&topicTerms.length>=2&&hits>=2&&hits/Math.min(questionTerms.length,topicTerms.length)>=0.5;
+      });
       let generated, answer, status = 'answered', modelNotice = '';
       try {
         generated = await askModel(question, sources, history);
@@ -544,7 +504,15 @@ const server = http.createServer(async (req, res) => {
       await logEvent({ outcome: status, unit: unit || null, sourceIds: sources.map(d=>d.id) });
       const citeRefs = generated?.decision === 'answer' ? generated.citation_refs : (generated?.decision==='no_answer'?[]:sources.map((_,i)=>i+1));
       const citations = citeRefs.map(ref=>{const s=sources[ref-1];return {ref,title:s.title,unit:s.unit,section:s.section,url:s.url};});
-      return send(res, 200, { id, answer, modelNotice, citations, question, unit, history, experiences: experienceMatches.map(x=>({text:x.text,source:x.source})), status });
+      const citedUnits=new Set(citations.map(c=>c.unit).filter(Boolean));
+      const answerTerms=[...new Set(normalize((generated?.claims||[]).map(c=>c.text).join(' ')).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
+      const experiences=status==='answered'?experienceMatches.filter(x=>{
+        if(!citedUnits.has(x.unit)||answerTerms.length<2)return false;
+        const topicTerms=[...new Set(normalize(x.topic).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
+        const overlap=topicTerms.filter(t=>answerTerms.some(w=>tokenMatches(t,w))).length;
+        return overlap>=2&&overlap/Math.min(topicTerms.length,answerTerms.length)>=0.5;
+      }).map(x=>({text:x.text,source:x.source,unit:x.unit,approvedAt:x.approvedAt})):[];
+      return send(res, 200, { id, answer, modelNotice, citations, question, unit, history, experiences, status });
     }
     if (req.method === 'POST' && url.pathname === '/api/feedback') {
       const data = await bodyJson(req);
