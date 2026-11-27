@@ -16,6 +16,7 @@ import { classifyScope, outOfScopeReply } from './lib/scope-filter.js';
 import { classifyRequestOutcome } from './lib/failure-class.js';
 import { missingAnswerFacets } from './lib/answer-completeness.js';
 import { expandProcessSearchQuery } from './lib/search-aliases.js';
+import { hybridRetrievalScore } from './lib/retrieval-score.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const chunkerVersion = 'section-overlap-v2';
@@ -264,7 +265,9 @@ async function search(q, unit = '', queryVector = null) {
   });
   for(const m of relevant){
     const rank=ranks.get(m.chunkId)||{};
-    m.score=(rank.lexical?1/(60+rank.lexical):0)+(rank.semantic?1/(60+rank.semantic):0);
+    // Exact term coverage helps prevent a semantically similar section from burying
+    // the passage that actually contains the queried rule.
+    m.score=hybridRetrievalScore(rank.lexical,rank.semantic,m.coverage);
   }
   relevant.sort((a,b)=>b.score-a.score||b.lexicalScore-a.lexicalScore||b.similarity-a.similarity);
   // Keep the strongest evidence across documents, while allowing more than one section per source.
