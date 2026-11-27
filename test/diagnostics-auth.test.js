@@ -63,4 +63,3 @@ test('debug diagnostics require the quality admin token and omit prompt-bearing 
   assert.equal(events.every(event=>Array.isArray(event.pipelineFailures)),true);
   assert.equal(events.every(event=>!('question' in event)&&!('answer' in event)),true);
 });
-

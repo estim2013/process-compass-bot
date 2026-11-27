@@ -30,4 +30,3 @@ docker run -d \
   --health-retries 3 \
   "$IMAGE"
 echo "Process Compass is listening on port ${APP_PORT}. Check /api/health."
-

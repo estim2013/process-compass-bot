@@ -9,7 +9,14 @@ import { fileURLToPath } from 'node:url';
 import { normalizeComparable } from './lib/claim-validation.js';
 import { pipelineFailure, safeFailureCode, classifyRetryOutcome, classifyTransportFailure } from './lib/pipeline-failure.js';
 import { validateModelAnswer } from './lib/model-answer-validator.js';
+import { selectAnswerContext } from './lib/answer-context.js';
+import { retryGuidance } from './lib/retry-guidance.js';
+import { evidenceClarification } from './lib/evidence-clarification.js';
 import { classifyScope, outOfScopeReply } from './lib/scope-filter.js';
+import { classifyRequestOutcome } from './lib/failure-class.js';
+import { missingAnswerFacets } from './lib/answer-completeness.js';
+import { expandProcessSearchQuery } from './lib/search-aliases.js';
+import { hybridRetrievalScore } from './lib/retrieval-score.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const chunkerVersion = 'section-overlap-v2';
@@ -44,7 +51,7 @@ async function measureStage(trace, name, operation) {
   finally { trace.stages[name] = (trace.stages[name] || 0) + Math.round(performance.now() - started); }
 }
 function recordModelCall(trace, call) {
-  if (trace) trace.modelCalls.push({ purpose: call.purpose, attempt: call.attempt, retryReason: call.retryReason || null, durationMs: Math.round(call.durationMs), headerMs: call.headerMs == null ? null : Math.round(call.headerMs), bodyMs: call.bodyMs == null ? null : Math.round(call.bodyMs), inputChars: call.inputChars, outputChars: call.outputChars ?? null, status: call.status ?? null, finishReason: call.finishReason ?? null, inputTokens: call.inputTokens ?? null, outputTokens: call.outputTokens ?? null, error: call.error ?? null });
+  if (trace) trace.modelCalls.push({ purpose: call.purpose, attempt: call.attempt, retryReason: call.retryReason || null, durationMs: Math.round(call.durationMs), headerMs: call.headerMs == null ? null : Math.round(call.headerMs), bodyMs: call.bodyMs == null ? null : Math.round(call.bodyMs), inputChars: call.inputChars, outputChars: call.outputChars ?? null, reasoningChars: call.reasoningChars ?? null, status: call.status ?? null, finishReason: call.finishReason ?? null, inputTokens: call.inputTokens ?? null, outputTokens: call.outputTokens ?? null, error: call.error ?? null });
 }
 function recordPipelineFailure(trace, error, attempt) {
   if (!trace) return;
@@ -219,7 +226,8 @@ function embeddingsReady(){
 }
 
 async function search(q, unit = '', queryVector = null) {
-  const terms = [...new Set(normalize(q).split(/\s+/).filter(t => t.length > 2 && !stopWords.has(t)))];
+  const searchText=expandProcessSearchQuery(q);
+  const terms = [...new Set(normalize(searchText).split(/\s+/).filter(t => t.length > 2 && !stopWords.has(t)))];
   if (terms.length < 1 && !queryVector) return [];
   const matches = [];
   const chunks=db.prepare(`SELECT c.id,c.section,c.content,c.embedding_json,c.embedding_model,c.embedding_dim,d.id AS doc_id,d.title,d.unit,d.process,d.version,d.url,d.tags_json
@@ -257,7 +265,9 @@ async function search(q, unit = '', queryVector = null) {
   });
   for(const m of relevant){
     const rank=ranks.get(m.chunkId)||{};
-    m.score=(rank.lexical?1/(60+rank.lexical):0)+(rank.semantic?1/(60+rank.semantic):0);
+    // Exact term coverage helps prevent a semantically similar section from burying
+    // the passage that actually contains the queried rule.
+    m.score=hybridRetrievalScore(rank.lexical,rank.semantic,m.coverage);
   }
   relevant.sort((a,b)=>b.score-a.score||b.lexicalScore-a.lexicalScore||b.similarity-a.similarity);
   // Keep the strongest evidence across documents, while allowing more than one section per source.
@@ -316,20 +326,24 @@ async function askModel(question, sources, history = [], attempt = 0, validation
   try{response = await fetch(`${process.env.POLZA_BASE_URL || 'https://polza.ai/api/v1'}/chat/completions`, {
     method: 'POST', headers: { 'authorization': `Bearer ${key}`, 'content-type': 'application/json' },
     signal: AbortSignal.timeout(attempt?90000:60000),
-    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: attempt?0:0.1, max_tokens: attempt?2500:1800, enable_thinking: false, reasoning_effort: 'none', response_format: { type: 'json_schema', json_schema: { name: 'grounded_process_answer', strict: true, schema: { type: 'object', properties: { decision: { type: 'string', enum: ['answer','clarify','no_answer'] }, intent_clear: { type: 'boolean' }, intent_summary: { type: 'string' }, claims: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, source_ref: { type: 'integer' }, evidence: { type: 'string' } }, required: ['text','source_ref','evidence'], additionalProperties: false } }, clarifying_question: { type: 'string' } }, required: ['decision','intent_clear','intent_summary','claims','clarifying_question'], additionalProperties: false } } },
+    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: 0, max_tokens: attempt?2500:1800, reasoning: { effort: 'none' }, response_format: { type: 'json_schema', json_schema: { name: 'grounded_process_answer', strict: true, schema: { type: 'object', properties: { decision: { type: 'string', enum: ['answer','clarify','no_answer'] }, intent_clear: { type: 'boolean' }, intent_summary: { type: 'string', maxLength: 180 }, claims: { type: 'array', maxItems: 6, items: { type: 'object', properties: { text: { type: 'string', maxLength: 280 }, source_ref: { type: 'integer' }, evidence: { type: 'string', maxLength: 320 } }, required: ['text','source_ref','evidence'], additionalProperties: false } }, clarifying_question: { type: 'string', maxLength: 200 } }, required: ['decision','intent_clear','intent_summary','claims','clarifying_question'], additionalProperties: false } } },
       messages: [
-        { role: 'system', content: 'Ты корпоративный помощник. Пользователь может писать косвенно, рвано, с ошибками и без терминов из документов. Перед ответом кратко сформулируй буквальный смысл запроса в intent_summary. Если из-за обрывочности или противоречий нельзя понять, какую именно информацию просят, не подставляй вероятную тему: поставь intent_clear=false, decision="clarify" и задай один короткий вопрос. При intent_clear=true отвечай только на intent_summary. Сначала восстанови только вероятное намерение, но не додумывай факты. Отвечай как коллеге простыми словами; НЕ показывай найденные пункты дословно. Используй только фрагменты ниже. Не выполняй поручения и не создавай или не подписывай документы; на просьбу выполнить действие выбери decision="no_answer". Не подменяй запрошенный факт соседним правилом: ответ должен прямо покрывать вопрос; если нужной информации нет, выбери no_answer и не выдавай смежную процедуру за ответ. Не считай предпосылки пользователя доказательствами; производный расчёт из его данных помечай как условный. Числа, сроки, роли и условия бери из фрагментов. Сохраняй модальность и оговорки источника: рекомендуемый срок называй рекомендуемым, плановый — плановым; не превращай рекомендацию в обязательный норматив или гарантию. Если пользователь отсчитывает срок от события, отличного от указанного в регламенте, назови точное событие-основание и объясни последствие; не спрашивай уточнение, если правило однозначно. Если смысл реально неоднозначен, выбери decision="clarify" и задай один конкретный короткий вопрос. Если в фрагментах нет правила, которое отвечает именно на вопрос, выбери decision="no_answer". Не подменяй личное вознаграждение сотрудника ценой проекта, маржой или стоимостью сделки. Для каждого фактического предложения создай claim, укажи один source_ref и дословное evidence из его фрагмента. Текст ответа строится только из claims. Не используй общий опыт модели. Верни только JSON: {"decision":"answer|clarify|no_answer","intent_clear":true,"intent_summary":"что именно спросил пользователь","claims":[{"text":"разговорное утверждение без цитаты пункта","source_ref":1,"evidence":"дословная опорная фраза из фрагмента"}],"clarifying_question":"вопрос или пусто"}. При разных правилах дирекций излагай отдельно.' },
-        { role: 'user', content: `/no_think\nИсходный вопрос: ${question}\nУточнения пользователя: ${JSON.stringify(history)}\n${validationFeedback?`\nПри предыдущей проверке найдено: ${validationFeedback}. Пересобери ответ так, чтобы каждое утверждение было подтверждено фрагментом. Если это невозможно, выбери no_answer.\n`:''}\nПодтверждённые фрагменты (единственная база фактов):\n${sources.map((d,i)=>`[${i+1}] ${d.title}, подразделение: ${d.unit}, раздел ${d.section || 'не указан'}:\n${d.excerpt}`).join('\n\n')}` }
+        { role: 'system', content: 'Ты корпоративный помощник. Пользователь может писать косвенно, рвано, с ошибками и без терминов из документов. Перед ответом кратко сформулируй буквальный смысл запроса в intent_summary. Если из-за обрывочности или противоречий нельзя понять, какую именно информацию просят, не подставляй вероятную тему: поставь intent_clear=false, decision="clarify" и задай один короткий вопрос. При intent_clear=true отвечай только на intent_summary. Не уточняй у пользователя, «тот ли это раздел», когда найденный фрагмент прямо отвечает на вопрос. Не считай различие бытового и регламентного глагола (например, «выбрать» и «назначить») самостоятельной неоднозначностью: сначала сопоставь роли, действие и объект в найденном правиле. Уточняй только если после этого остаются как минимум два разных применимых варианта. Сначала восстанови только вероятное намерение, но не додумывай факты. Отвечай как коллеге простыми словами; НЕ показывай найденные пункты дословно. Используй только фрагменты ниже. Не выполняй поручения и не создавай или не подписывай документы; на просьбу выполнить действие выбери decision="no_answer". Не подменяй запрошенный факт соседним правилом: ответ должен прямо покрывать вопрос; если нужной информации нет, выбери no_answer и не выдавай смежную процедуру за ответ. Не считай предпосылки пользователя доказательствами; производный расчёт из его данных помечай как условный. Числа, сроки, роли и условия бери из фрагментов. При границах диапазонов сохраняй направление и включительность исходного условия: «не более N» включает N, «более N» не включает N; не выбирай соседнюю ветку. Сохраняй модальность и оговорки источника: рекомендуемый срок называй рекомендуемым, плановый — плановым; не превращай рекомендацию в обязательный норматив или гарантию. Переноси ограничение области действия правила: если пункт начинается с условия или описывает особый случай, не распространяй следующие шаги на все заявки/проекты; явно называй это условие. Перед ответом разложи вопрос на все запрошенные части, особенно сочетания «кто и что», «кто и при каких условиях», «что и в какой срок». На каждую часть дай отдельное подтвержденное утверждение; если источник подтверждает только часть, скажи, что именно осталось не подтверждено, и не создавай впечатление полного ответа. Для вопросов «кто/кого/кому» назови конкретную должность или роль, а не только цель действия. Для перечней условий и материалов проверь каждый перечисленный в источнике пункт и не заменяй список одним примером. Если правило в одном пункте применимо только при условии, повтори это условие в ответе, даже если вопрос его не назвал. Если пользователь отсчитывает срок от события, отличного от указанного в регламенте, назови точное событие-основание и объясни последствие; не спрашивай уточнение, если правило однозначно. Если смысл реально неоднозначен, выбери decision="clarify" и задай один конкретный короткий вопрос. Если в фрагментах нет правила, которое отвечает именно на вопрос, выбери decision="no_answer". Не подменяй личное вознаграждение сотрудника ценой проекта, маржой или стоимостью сделки. Для каждого фактического утверждения создай claim с одним source_ref. В evidence скопируй дословно короткий непрерывный фрагмент до 320 символов; не копируй целый раздел. Пиши только необходимые для ответа утверждения и условия; одно claim может кратко объединить соседние действия из одного пункта. Текст ответа строится только из claims. Не используй общий опыт модели. Верни только JSON: {"decision":"answer|clarify|no_answer","intent_clear":true,"intent_summary":"краткий смысл вопроса","claims":[{"text":"короткое утверждение","source_ref":1,"evidence":"краткий дословный фрагмент источника"}],"clarifying_question":"вопрос или пусто"}. При разных правилах дирекций излагай отдельно.' },
+        { role: 'user', content: `/no_think\nИсходный вопрос: ${question}\nУточнения пользователя: ${JSON.stringify(history)}\n${validationFeedback?`\nПрошлая попытка не прошла проверку: ${validationFeedback}. Исправь только неподтверждённое утверждение, сократи формулировки и evidence до самой короткой точной опоры. Если после проверки источников ответ действительно отсутствует, выбери no_answer.\n`:''}\nПодтверждённые фрагменты (единственная база фактов):\n${sources.map((d,i)=>`[${i+1}] ${d.title}, подразделение: ${d.unit}, раздел ${d.section || 'не указан'}:\n${d.excerpt}`).join('\n\n')}` }
       ]
     })
   }); headersAt=performance.now();}catch(error){const failure=pipelineFailure('model_transport',classifyTransportFailure({errorName:error.name}),'Model request failed',{cause:error});recordPipelineFailure(trace,failure,attempt);recordModelCall(trace,{purpose:'answer',attempt,retryReason:validationFeedback,durationMs:performance.now()-callStarted,error:error.name||'request_error'});if(attempt===0){await retryDelay(500);return askModel(question,sources,history,1,validationFeedback||'временная ошибка соединения с моделью',trace);}throw failure;}
   if (!response.ok) {const code=classifyTransportFailure({status:response.status});const failure=pipelineFailure('model_transport',code,`Polza API returned ${response.status}`);recordPipelineFailure(trace,failure,attempt);recordModelCall(trace,{purpose:'answer',attempt,retryReason:validationFeedback,durationMs:performance.now()-callStarted,headerMs:headersAt-callStarted,status:response.status});if(attempt===0&&retryableApiStatuses.has(response.status)){await retryDelay(500);return askModel(question,sources,history,1,validationFeedback||`временный ответ API ${response.status}`,trace);} throw failure; }
   let data;
   try { data = await response.json(); } catch (error) { const failure=pipelineFailure('model_output', 'invalid_json', 'Model returned invalid JSON', { cause: error });recordModelCall(trace,{purpose:'answer',attempt,retryReason:validationFeedback,durationMs:performance.now()-callStarted,headerMs:headersAt-callStarted,bodyMs:performance.now()-headersAt,status:response.status});recordPipelineFailure(trace,failure,attempt);throw failure; }
+  const finishReason=data.choices?.[0]?.finish_reason;
   const raw = data.choices?.[0]?.message?.content;
   const parsedAt=performance.now();
-  recordModelCall(trace,{purpose:'answer',attempt,retryReason:validationFeedback,durationMs:parsedAt-callStarted,headerMs:headersAt-callStarted,bodyMs:parsedAt-headersAt,status:response.status,finishReason:data.choices?.[0]?.finish_reason,inputTokens:data.usage?.prompt_tokens,outputTokens:data.usage?.completion_tokens});
-  if (!raw) { const failure=pipelineFailure('model_output', 'empty_response', 'Model returned empty content');recordPipelineFailure(trace,failure,attempt);if(attempt===0)return askModel(question,sources,history,1,'пустой ответ модели',trace);throw failure; }
+  const modelMessage=data.choices?.[0]?.message||{};
+  const reasoningValue=modelMessage.reasoning_content??modelMessage.reasoning??modelMessage.reasoning_details??null;
+  const reasoningChars=typeof reasoningValue==='string'?reasoningValue.length:reasoningValue==null?0:JSON.stringify(reasoningValue).length;
+  recordModelCall(trace,{purpose:'answer',attempt,retryReason:validationFeedback,durationMs:parsedAt-callStarted,headerMs:headersAt-callStarted,bodyMs:parsedAt-headersAt,status:response.status,finishReason:data.choices?.[0]?.finish_reason,inputTokens:data.usage?.prompt_tokens,outputTokens:data.usage?.completion_tokens,outputChars:typeof raw==='string'?raw.length:0,reasoningChars});
+  if (!raw) { const code=finishReason==='length'?'output_truncated':'empty_response';const failure=pipelineFailure('model_output', code, code==='output_truncated'?'Model output reached its token limit':'Model returned empty content');recordPipelineFailure(trace,failure,attempt);if(attempt===0)return askModel(question,sources,history,1,code==='output_truncated'?'ответ оборвался на лимите длины':'пустой ответ модели',trace);throw failure; }
   const validationStarted=performance.now();
   try {
     const result = validateModelAnswer(raw,sources,normalize);
@@ -337,7 +351,10 @@ async function askModel(question, sources, history = [], attempt = 0, validation
     return result;
   } catch(error) {
     recordPipelineFailure(trace,error,attempt);
-    if(attempt===0)return askModel(question,sources,history,1,error.message,trace);
+    if(attempt===0){
+      const retrySources=error?.stage==='evidence_binding'&&error?.code==='span_not_found'?sources.slice(0,1):sources;
+      return askModel(question,retrySources,history,1,retryGuidance(error),trace);
+    }
     if (trace) {
       trace.retryOutcome=classifyRetryOutcome(trace.pipelineFailures,false);
     }
@@ -351,7 +368,7 @@ async function expandSearch(question, history = []) {
   if (!key) return null;
   const response = await fetch(`${process.env.POLZA_BASE_URL || 'https://polza.ai/api/v1'}/chat/completions`, {
     method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, signal: AbortSignal.timeout(15000),
-    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: 0, max_tokens: 500, enable_thinking: false, reasoning_effort: 'none', response_format: { type: 'json_object' },
+    body: JSON.stringify({ model: process.env.POLZA_MODEL || 'qwen/qwen3.8-max', temperature: 0, max_tokens: 500, reasoning: { effort: 'none' }, response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: 'Преобразуй неформальный или рваный вопрос в поисковые слова для корпоративных регламентов: сохрани ключевые слова пользователя и добавь их нейтральные корпоративные эквиваленты, когда регламент может называть тот же смысл иначе. Это только запрос для поиска, не ответ. Не добавляй цифры, сроки, роли, решения или новые обстоятельства. Если можно понять два разных намерения, задай один короткий вопрос и верни пустые search_terms. Верни только JSON: {"search_terms":["..."],"clarifying_question":"..."}. До 8 терминов.' },
         { role: 'user', content: `/no_think\nВопрос: ${question}\nУточнения: ${JSON.stringify(history)}` }
@@ -475,10 +492,13 @@ const server = http.createServer(async (req, res) => {
       const trace={id,started:performance.now(),stages:{},modelCalls:[],candidates:[],refusalReason:null,queryExpansionCalled:false};
       const finish=async(status,body,httpStatus=200)=>{
         const totalMs=Math.round(performance.now()-trace.started);
-        const safeModelCalls=trace.modelCalls.map(({purpose,attempt,durationMs,headerMs,bodyMs,status,finishReason,inputTokens,outputTokens})=>({purpose,attempt,durationMs,headerMs,bodyMs,status,finishReason,inputTokens,outputTokens}));
-        const latency={totalMs,stages:trace.stages,modelCallCount:safeModelCalls.length,modelTimeMs:safeModelCalls.reduce((n,x)=>n+(x.durationMs||0),0),retryCount:safeModelCalls.filter(x=>x.attempt>0).length,sourceCount:trace.sourceCount||0,unitCount:trace.unitCount||0,modelCalls:safeModelCalls};
-        void logEvent({outcome:body.status||status,unit:body.unit||unit||null,requestId:id,sourceIds:trace.sourceIds||[],refusalReason:trace.refusalReason||null,pipelineFailures:(trace.pipelineFailures||[]).map(({stage,code,attempt})=>({stage,code,attempt})),retryOutcome:trace.retryOutcome||null,latency}).catch(error=>console.warn('Latency log write failed: '+error.message));
-        if(input.debug===true&&isQualityAdmin(req))body.diagnostics={requestId:id,latency,refusalReason:trace.refusalReason||null,pipelineFailures:trace.pipelineFailures||[],retryOutcome:trace.retryOutcome||null,queryExpansionCalled:trace.queryExpansionCalled,candidates:trace.candidates};
+        const safeModelCalls=trace.modelCalls.map(({purpose,attempt,durationMs,headerMs,bodyMs,status,finishReason,inputTokens,outputTokens,outputChars,reasoningChars})=>({purpose,attempt,durationMs,headerMs,bodyMs,status,finishReason,inputTokens,outputTokens,outputChars,reasoningChars}));
+        const latency={totalMs,stages:trace.stages,modelCallCount:safeModelCalls.length,modelTimeMs:safeModelCalls.reduce((n,x)=>n+(x.durationMs||0),0),retryCount:safeModelCalls.filter(x=>x.attempt>0).length,sourceCount:trace.sourceCount||0,contextSourceCount:trace.contextSourceCount||0,unitCount:trace.unitCount||0,modelCalls:safeModelCalls};
+        const outcome=body.status||status;
+        const pipelineFailures=(trace.pipelineFailures||[]).map(({stage,code,attempt})=>({stage,code,attempt}));
+        const failureClass=classifyRequestOutcome(outcome,trace.refusalReason,pipelineFailures);
+        void logEvent({outcome, failureClass, unit:body.unit||unit||null,requestId:id,sourceIds:trace.sourceIds||[],refusalReason:trace.refusalReason||null,pipelineFailures,rejectedClaimCodes:trace.rejectedClaimCodes||[],retryOutcome:trace.retryOutcome||null,latency}).catch(error=>console.warn('Latency log write failed: '+error.message));
+        if(input.debug===true&&isQualityAdmin(req))body.diagnostics={requestId:id,latency,failureClass,refusalReason:trace.refusalReason||null,pipelineFailures,retryOutcome:trace.retryOutcome||null,queryExpansionCalled:trace.queryExpansionCalled,candidates:trace.candidates};
         return send(res,httpStatus,body);
       };
       const offTopic=classifyScope(question,history);
@@ -510,9 +530,33 @@ const server = http.createServer(async (req, res) => {
         return finish(200,{id,status:'escalation',answer:'В предоставленных материалах не нашла подтверждённого ответа именно на этот вопрос. Хотите отправить обращение в службу качества?',citations:[],sources:[]});
       }
       // One structured model call now selects evidence and drafts claims together; citation validation remains deterministic in askModel.
+      const answerSources=selectAnswerContext(sources);
+      trace.contextSourceCount=answerSources.length;
       let generated,answer,status='answered',modelNotice='';
-      try{generated=await measureStage(trace,'evidenceAndAnswerMs',()=>askModel(question,sources,history,0,'',trace));}
-      catch(error){const failure=safeFailureCode(error);console.warn(`Answer pipeline failed at ${failure.stage}/${failure.code}`);status='escalation';trace.refusalReason='MODEL_CALL_OR_VALIDATION_ERROR';modelNotice='Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?';}
+      try{generated=await measureStage(trace,'evidenceAndAnswerMs',()=>askModel(question,answerSources,history,0,'',trace));}
+      catch(error){const failure=safeFailureCode(error);console.warn(`Answer pipeline failed at ${failure.stage}/${failure.code}`);
+        const candidate=answerSources[0];
+        const clarification=failure.stage==='evidence_binding'&&failure.code==='span_not_found'&&candidate?.coverage>=0.2?evidenceClarification(candidate):null;
+        if(clarification){trace.refusalReason='EVIDENCE_LINK_AMBIGUOUS';return finish(200,{id,status:'clarify',answer:clarification,citations:[{ref:1,title:candidate.title,unit:candidate.unit,section:candidate.section,url:candidate.url}]});}
+        status='escalation';trace.refusalReason='MODEL_CALL_OR_VALIDATION_ERROR';modelNotice='Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?';}
+      if(generated?.decision==='answer'){
+        let missingFacets=missingAnswerFacets(question,generated.claims);
+        if(missingFacets.length){
+          trace.completenessRetry=true;
+          const feedback=`Ответ не покрыл все типы информации, прямо запрошенные пользователем: ${missingFacets.join('; ')}. Проверь вопрос ещё раз по источникам; добавь отдельные подтверждённые claims для пропущенных частей. Не заполняй пробел догадкой.`;
+          try{
+            const retried=await measureStage(trace,'evidenceAndAnswerMs',()=>askModel(question,answerSources,history,1,feedback,trace));
+            if(retried?.decision==='answer'){
+              const remaining=missingAnswerFacets(question,retried.claims);
+              if(remaining.length<missingFacets.length||(!retried.partial&&generated.partial)){
+                generated=retried;
+                missingFacets=remaining;
+              }
+            }
+          }catch(error){trace.completenessRetryFailure=safeFailureCode(error);}
+          if(missingFacets.length){generated.partial=true;generated.uncoveredFacets=missingFacets;}
+        }
+      }
       if(!generated){status='escalation';trace.refusalReason=trace.refusalReason||'MODEL_NOT_CONFIGURED';answer='Не удалось сформулировать ответ, подтверждённый документами. Хотите передать вопрос в службу качества?';}
       else if(generated.decision==='clarify'){
         if(history.length>=2){status='escalation';trace.refusalReason='CLARIFICATION_LIMIT';answer='После двух уточнений я всё ещё не могу выбрать однозначное правило. Хотите передать вопрос специалисту службы качества?';}
@@ -521,7 +565,16 @@ const server = http.createServer(async (req, res) => {
         status='escalation';trace.refusalReason='NO_SUPPORTED_ANSWER';answer='В найденных материалах нет подтверждённого ответа именно на этот вопрос. Хотите отправить обращение в службу качества?';
       }else{
         answer=generated.answer;
-        const citedSources=generated.citation_refs.map(ref=>sources[ref-1]);
+        if(generated.partial){
+          status='partial_answer';
+          const partialNote=generated.uncoveredFacets?.length
+            ?'Не все части вопроса удалось подтвердить по найденным источникам.'
+            :'Остальные утверждения не прошли проверку источников, поэтому я их не показываю.';
+          answer=`В документах удалось подтвердить только часть ответа. ${answer} ${partialNote}`;
+          trace.refusalReason='PARTIAL_VALIDATED_CLAIMS';
+          trace.rejectedClaimCodes=generated.rejected_claims;
+        }
+        const citedSources=generated.citation_refs.map(ref=>answerSources[ref-1]);
         const citedUnits=[...new Set(citedSources.map(s=>s.unit).filter(Boolean))];
         // Ask for a unit before exposing a cross-unit answer. This path uses one model hop instead of two.
         if(!unit&&!compareAll&&!asksAcrossUnits&&citedUnits.length>1){
@@ -536,7 +589,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       const citeRefs=generated?.decision==='answer'?generated.citation_refs:[];
-      const citations=citeRefs.map(ref=>{const s=sources[ref-1];return {ref,title:s.title,unit:s.unit,section:s.section,url:s.url};});
+      const citations=citeRefs.map(ref=>{const s=answerSources[ref-1];return {ref,title:s.title,unit:s.unit,section:s.section,url:s.url};});
       const citedUnits=new Set(citations.map(c=>c.unit).filter(Boolean));
       const questionTerms=[...new Set(normalize([question,...history].join(' ')).split(/\s+/).filter(t=>t.length>3&&!stopWords.has(t)))];
       const experienceMatches=verifiedExperiences.filter(x=>{
@@ -552,7 +605,7 @@ const server = http.createServer(async (req, res) => {
         const overlap=topicTerms.filter(t=>answerTerms.some(w=>tokenMatches(t,w))).length;
         return overlap>=2&&overlap/Math.min(topicTerms.length,answerTerms.length)>=0.5;
       }).map(x=>({text:x.text,source:x.source,unit:x.unit,approvedAt:x.approvedAt})):[];
-      return finish(200,{id,answer,modelNotice,citations,question,unit,history,experiences,status});
+      return finish(200,{id,answer,modelNotice,citations,question,unit,history,experiences,status,...(status==='partial_answer'?{partial:true}:{})});
     }
     if (req.method === 'POST' && url.pathname === '/api/feedback') {
       const data = await bodyJson(req);
@@ -631,4 +684,3 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { send(res, 500, { error: e.message || 'Внутренняя ошибка' }); }
 });
 server.listen(port, process.env.HOST || '127.0.0.1', () => console.log(`Process Compass MVP listening on ${process.env.HOST || '127.0.0.1'}:${port}`));
-

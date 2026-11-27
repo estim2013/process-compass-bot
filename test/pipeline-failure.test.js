@@ -25,4 +25,3 @@ test('maps transport failures from the failure boundary without relying on error
   assert.equal(classifyTransportFailure({status:503}),'http_5xx');
   assert.equal(classifyTransportFailure({status:401}),'http_error');
 });
-

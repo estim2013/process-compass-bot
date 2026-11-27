@@ -28,7 +28,7 @@ test('classifies deterministic claim validation failures without exposing claim 
   );
   assert.throws(
     () => validateClaim('Ответьте за 3 дня', 'Ответьте в течение трех рабочих дней'),
-    error => error instanceof PipelineFailure && error.stage === 'claim_validation' && error.code === 'condition_mismatch'
+    error => error instanceof PipelineFailure && error.stage === 'claim_validation' && error.code === 'working_day_condition_mismatch'
   );
 });
 
@@ -56,6 +56,12 @@ test('recognizes number words after ё normalization', () => {
 test('preserves conditional rules', () => {
   assert.throws(() => validateClaim('Отправьте заявку', 'Если данные неполные, отправьте заявку на уточнение'), /условие/);
   assert.doesNotThrow(() => validateClaim('Если данные неполные, отправьте заявку', 'Если данные неполные, отправьте заявку на уточнение'));
+  assert.doesNotThrow(() => validateClaim('При нарушении SLA заявка эскалируется руководителю', 'Если время реакции нарушено, заявка передается руководителю'));
+  assert.throws(() => validateClaim('Приоритет не меняется', 'Приоритет не меняется, если SLA нарушен'), /условие/);
   assert.throws(() => validateClaim('Отправьте заявку при условии готовности данных', 'Подавать только если данные готовы'), /только если/);
+});
+
+test('distinguishes inability from a policy prohibition', () => {
+  assert.doesNotThrow(() => validateClaim('Когда в проекте есть риск, который нельзя ни исключить, ни принять, РП эскалирует его', 'Если риск не может быть исключён или принят, РП эскалирует его на SS'));
 });
 
