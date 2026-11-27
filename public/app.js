@@ -8,18 +8,32 @@ async function init() {
 }
 
 function mountQualityForm(question, unit) {
-  const box=$('#quality-form'); if(!box)return;
-  box.innerHTML=`<div class="card"><label for="reply-email">Куда прислать ответ службы качества?</label><input id="reply-email" type="email" autocomplete="email" placeholder="name@company.ru"><label class="consent"><input id="reply-consent" type="checkbox"> Согласна передать мой вопрос и этот адрес службе качества. Адрес не попадёт в аналитику.</label><button id="send-quality">Отправить обращение</button><div id="send-result" class="hint"></div></div>`;
-  $('#send-quality').onclick=async()=>{
-    const email=$('#reply-email').value.trim(),consent=$('#reply-consent').checked;
-    const output=$('#send-result');
+  document.querySelector('#quality-dialog')?.remove();
+  const dialog=document.createElement('dialog');
+  dialog.id='quality-dialog';
+  dialog.className='quality-dialog';
+  dialog.innerHTML=`<form id="quality-form" class="quality-dialog-card"><button type="button" class="dialog-close secondary" aria-label="Закрыть">×</button><p class="eyebrow">ОБРАЩЕНИЕ В СЛУЖБУ КАЧЕСТВА</p><h2>Куда прислать разъяснение?</h2><p class="hint">Отправим специалистам ваш вопрос как вы его написали. Ответ придёт на указанный адрес.</p><label for="reply-email">Ваш email</label><input id="reply-email" name="email" type="email" autocomplete="email" required maxlength="254" placeholder="name@company.ru"><label for="quality-question-preview">В службу качества уйдёт вопрос</label><textarea id="quality-question-preview" rows="4" readonly></textarea><label class="consent"><input id="reply-consent" type="checkbox" required> Согласен(на) передать вопрос и этот email в службу качества для подготовки ответа.</label><div id="send-result" class="hint" role="status" aria-live="polite"></div><div class="dialog-actions"><button type="button" class="secondary" id="cancel-quality">Отмена</button><button id="send-quality">Отправить вопрос</button></div></form>`;
+  document.body.append(dialog);
+  $('#quality-question-preview').value=question;
+  const close=()=>dialog.close();
+  dialog.querySelector('.dialog-close').onclick=close;
+  dialog.querySelector('#cancel-quality').onclick=close;
+  dialog.addEventListener('click',event=>{if(event.target===dialog)close();});
+  dialog.addEventListener('close',()=>dialog.remove(),{once:true});
+  $('#quality-form').addEventListener('submit',async event=>{
+    event.preventDefault();
+    const email=$('#reply-email').value.trim(),consent=$('#reply-consent').checked,button=$('#send-quality'),output=$('#send-result');
+    button.disabled=true; output.textContent='Отправляю обращение…';
     try {
       const response=await fetch('/api/quality/requests',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({question,unit,email,consent})});
       const data=await response.json();if(!response.ok)throw new Error(data.error);
-      output.innerHTML=`${esc(data.message)} Номер обращения: <code>${esc(data.id)}</code>${data.mailto?`<br><a href="${esc(data.mailto)}">Открыть письмо в почте</a>`:''}<br><button class="secondary" id="check-quality-answer">Проверить ответ специалиста</button><div id="quality-answer-status" class="hint"></div>`;
-      $('#check-quality-answer').onclick=async()=>{const state=await fetch(`/api/quality/requests/${data.id}`).then(r=>r.json());$('#quality-answer-status').textContent=state.status==='answered'?`Ответ службы качества: ${state.answer}`:'Обращение ожидает ответа специалиста.'};
-    } catch(error){output.textContent=error.message;}
-  };
+      output.textContent=`${data.message} Номер обращения: ${data.id}`;
+      button.hidden=true;$('#cancel-quality').textContent='Закрыть';
+      if(data.mailto){const link=document.createElement('a');link.href=data.mailto;link.textContent='Открыть письмо в почте';link.className='quality-mailto';output.append(document.createElement('br'),link);}
+    } catch(error){output.textContent=error.message;button.disabled=false;}
+  });
+  dialog.showModal();
+  $('#reply-email').focus();
 }
 
 function renderCitations(citations=[]) {
@@ -39,12 +53,11 @@ async function ask(question, unit='', compareAll=false, history=[]) {
       return;
     }
     const status=data.status==='out_of_scope'?'Это вне моей базы':data.status==='escalation'?'Надёжного ответа в материалах не нашла':data.status==='sources_only'?'Не удалось проверить ответ по найденным источникам':data.status==='experience_only'?'Ответ службы качества · проверенный опыт':data.status==='partial_answer'?'Часть ответа подтверждена':'Ответ по материалам компании';
-    const qualityQuestion=[question,...history].join('\nУточнение: ');
-    result.innerHTML=`<article class="card"><div class="status ${['answered','experience_only'].includes(data.status)?'':'warning'}">${status}</div><p class="answer">${esc(data.answer)}</p>${data.modelNotice?`<p class="hint warning">${esc(data.modelNotice)}</p>`:''}${data.status==='clarify'?`<div class="clarify-form"><input id="clarify-reply" placeholder="Ваш ответ"><button id="continue-dialog">Продолжить</button><p class="hint">Можно уточнить до двух раз. Не вводите личные данные.</p></div>`:''}${data.experiences?.length?`<details class="experience"><summary>Дополнительное разъяснение службы качества</summary><p class="hint">Отдельно от ответа по регламенту; это разъяснение не является пунктом документа.</p>${data.experiences.map(x=>`<p>${esc(x.text)} <span class="hint">${esc([x.unit,x.approvedAt?new Date(x.approvedAt).toLocaleDateString('ru-RU'):'',x.source||''].filter(Boolean).join(' · '))}</span></p>`).join('')}</details>`:''}${renderCitations(data.citations)}${['escalation','sources_only','partial_answer'].includes(data.status)?`<div class="quality-action"><button id="quality-request">Да, отправить вопрос в службу качества</button><button class="secondary" id="quality-cancel">Нет</button><div id="quality-form"></div></div>`:''}<div class="feedback"><b>Ответ помог?</b><br><button class="secondary" data-rating="helpful">Да</button><button class="secondary" data-rating="not_helpful">Не совсем</button><button class="secondary" data-rating="missing">Не нашёл ответ</button><div id="feedback-msg" class="hint"></div></div></article>`;
+    result.innerHTML=`<article class="card"><div class="status ${['answered','experience_only'].includes(data.status)?'':'warning'}">${status}</div><p class="answer">${esc(data.answer)}</p>${data.modelNotice?`<p class="hint warning">${esc(data.modelNotice)}</p>`:''}${data.status==='clarify'?`<div class="clarify-form"><input id="clarify-reply" placeholder="Ваш ответ"><button id="continue-dialog">Продолжить</button><p class="hint">Можно уточнить до двух раз. Не вводите личные данные.</p></div>`:''}${data.experiences?.length?`<details class="experience"><summary>Дополнительное разъяснение службы качества</summary><p class="hint">Отдельно от ответа по регламенту; это разъяснение не является пунктом документа.</p>${data.experiences.map(x=>`<p>${esc(x.text)} <span class="hint">${esc([x.unit,x.approvedAt?new Date(x.approvedAt).toLocaleDateString('ru-RU'):'',x.source||''].filter(Boolean).join(' · '))}</span></p>`).join('')}</details>`:''}${renderCitations(data.citations)}${['escalation','sources_only','partial_answer'].includes(data.status)?`<div class="quality-action"><button id="quality-request">Да, отправить вопрос в службу качества</button><button class="secondary" id="quality-cancel">Нет</button></div>`:''}<div class="feedback"><b>Ответ помог?</b><br><button class="secondary" data-rating="helpful">Да</button><button class="secondary" data-rating="not_helpful">Не совсем</button><button class="secondary" data-rating="missing">Не нашёл ответ</button><div id="feedback-msg" class="hint"></div></div></article>`;
     $('#continue-dialog')?.addEventListener('click',()=>{const text=$('#clarify-reply').value.trim();if(text)ask(question,unit,compareAll,[...history,text]);});
-    $('#quality-request')?.addEventListener('click',()=>mountQualityForm(qualityQuestion,unit));
-    $('#quality-cancel')?.addEventListener('click',()=>{$('#quality-form').textContent='Хорошо. Если появится точный регламент, можно задать вопрос ещё раз.';});
-    result.querySelectorAll('[data-rating]').forEach(button=>button.onclick=async()=>{const saved=await fetch('/api/feedback',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({rating:button.dataset.rating})}).then(r=>r.json());$('#feedback-msg').textContent=saved.message;if(button.dataset.rating!=='helpful')$('#feedback-msg').innerHTML+=` <button class="secondary" id="feedback-quality">Отправить вопрос в качество</button>`;$('#feedback-quality')?.addEventListener('click',()=>mountQualityForm(qualityQuestion,unit));});
+    $('#quality-request')?.addEventListener('click',()=>mountQualityForm(question,unit));
+    $('#quality-cancel')?.addEventListener('click',()=>{$('#quality-cancel').textContent='Понятно';$('#quality-request').disabled=true;});
+    result.querySelectorAll('[data-rating]').forEach(button=>button.onclick=async()=>{const saved=await fetch('/api/feedback',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({rating:button.dataset.rating})}).then(r=>r.json());$('#feedback-msg').textContent=saved.message;if(button.dataset.rating!=='helpful')$('#feedback-msg').innerHTML+=` <button class="secondary" id="feedback-quality">Отправить вопрос в качество</button>`;$('#feedback-quality')?.addEventListener('click',()=>mountQualityForm(question,unit));});
   } catch(error) { result.innerHTML=`<article class="card error">${esc(error.message)}</article>`; }
 }
 
